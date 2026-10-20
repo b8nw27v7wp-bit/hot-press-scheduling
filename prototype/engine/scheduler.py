@@ -105,7 +105,16 @@ class Engine:
     def _compute_horizon(self) -> date:
         """日历必须覆盖到最晚可能完成日，否则延期工单会被误判为不可排。
 
-        取「最晚交期 + 前置偏移」与「按最悲观产能估算的总工作量」两者的较大值。
+        取「最晚交期 + 前置偏移」与「按工作量估算的天数」两者的较大值。
+
+        **这个估算不是单侧的悲观界，而是两个反向偏差互相抵消后的启发式**：
+        机台侧取「只有一台最慢机台、每天 1 班」（悲观，约等于把真实产能除以
+        机台数×每日班次），配比侧取 `max(ratios)`（乐观，按最好的那副模具算模数）。
+        两者相除后误差约为「配比离散度 ÷ (机台数 × 每日班次)」：配比离散度在这个
+        倍数以内时估算仍是上界，超出时地平线偏短，超出得多的工单会以
+        「排程超出日历范围」报 R007——而真正卡住它们的是下面那个十年封顶。
+        改成 `min(ratios)` 会让估算变成单侧上界，代价是地平线（在输入日历足够长时）
+        拉长到十年，内存与利用率分母随之变大，故保持现状、只把性质写明。
         """
         latest = max(
             (w.due_date for w in self.work_orders if w.due_date), default=self.params.plan_start
@@ -132,7 +141,7 @@ class Engine:
             if p.status.name == "AVAILABLE"
         ]
         if total_cycles and caps:
-            # 最悲观：只有一台最慢机台、每天 1 班。
+            # 机台侧取最悲观：只有一台最慢机台、每天 1 班。
             # 必须封顶：工作量极大时这个外推会溢出 date 范围（OverflowError），
             # 而超过十年仍排不完的计划本身已经没有意义，按 R005/R007 报瓶颈即可。
             pessimistic_days = min(total_cycles // max(1, min(caps)), MAX_HORIZON_DAYS)
