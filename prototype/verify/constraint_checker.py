@@ -64,9 +64,17 @@ class _Context:
         # 模具的身份是 (套, 模具号)，不是模具号：同一模具号可以出现在两个套里
         # （引擎按 §5.6 把它跨组串行）。若只按模具号建索引，后写的套会覆盖先写的，
         # 于是排在某套里的模具会被判成「不属于该套」而误报 C05。
-        self.mold_index: dict[tuple[str, str], tuple[MoldSet, Mold]] = {
-            (s.set_no, m.mold_no): (s, m) for s in mold_sets.values() for m in s.molds
-        }
+        #
+        # 同一模具号在**套内**也可能出现多次（资料错误）。引擎只从
+        # `MoldSet.available_molds` 里挑，那里按 (优先级, 模具号) 保留可用的一条；
+        # 校验器必须用同一副，否则会把合规结果判成 C07（模数不符）与 C13（超产）。
+        # 故先按优先级序铺全部模具（首次出现者胜），再用可用模具覆盖同键项。
+        self.mold_index: dict[tuple[str, str], tuple[MoldSet, Mold]] = {}
+        for s in mold_sets.values():
+            for m in sorted(s.molds, key=lambda x: (x.priority, x.mold_no)):
+                self.mold_index.setdefault((s.set_no, m.mold_no), (s, m))
+            for m in s.available_molds:
+                self.mold_index[(s.set_no, m.mold_no)] = (s, m)
         # 供「找不到」时区分「模具号不存在」与「模具号存在但不在该套里」
         self.sets_of_mold: dict[str, list[str]] = defaultdict(list)
         for s in mold_sets.values():

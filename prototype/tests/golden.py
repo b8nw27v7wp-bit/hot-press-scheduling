@@ -297,6 +297,23 @@ def main() -> int:
         f"{len(result.release_plan)} vs {len(result.assignments)}",
     ))
 
+    # 10b. 释放量必须与同一批次的产出同口径（§4.4：K(B) × 配比，含超产）。
+    #      此前只查过行数，行内的数量从没被断言过——「取错模具配比」这类缺陷
+    #      因此能通过全部测试。
+    batch_by_no = {b.batch_no: b for b in result.batches}
+    mismatched = [
+        (rp.batch_no, rp.pattern_code, rp.release_qty,
+         batch_by_no[rp.batch_no].output_qty.get(rp.pattern_code))
+        for rp in result.release_plan
+        if rp.batch_no in batch_by_no
+        and rp.release_qty != batch_by_no[rp.batch_no].output_qty.get(rp.pattern_code)
+    ]
+    checks.append((
+        "释放量 = 同批次该牌型的产出量（§4.4）",
+        not mismatched,
+        f"{len(mismatched)} 行不一致" + (f"，例 {mismatched[0]}" if mismatched else ""),
+    ))
+
     # 11. §21.3 黄金数据集比对：与外部基线逐项比对
     current = measure(result, presses)
     if update:

@@ -260,7 +260,7 @@ def build_reason(
 def build_release_plan(
     assignments: list[Assignment],
     orders: dict[str, WorkOrder],
-    molds: dict[str, Mold],
+    molds: dict[tuple[str, str], Mold],
     calendar: Calendar,
     batches: list[Batch] | None = None,
 ) -> list[ReleasePlan]:
@@ -275,12 +275,15 @@ def build_release_plan(
 
     传入 batches 时按批次口径；未传则回落到工单口径（保持旧行为，
     仅用于不掌握批次表的调用方）。
+
+    `molds` 以 **(套, 模具号)** 为键：同一模具号可以出现在两个套里，两处的配比
+    未必相同，只按模具号查会取到另一副模具的配比。
     """
     batch_index = {b.batch_no: b for b in (batches or [])}
     out: list[ReleasePlan] = []
     for a in sorted(assignments, key=lambda x: (x.batch_no, x.pattern_code, x.work_order_no)):
         wo = orders.get(a.work_order_no)
-        mold = molds.get(a.mold_no)
+        mold = molds.get((a.set_no, a.mold_no))
         if wo is None or mold is None:
             continue
         ratio = mold.ratios.get(a.pattern_code)

@@ -275,11 +275,15 @@ class Engine:
             assignments, by_no, diagnostics, self.calendar, self.params.group_size
         )
         order_delivery = delay.build_order_delivery(assignments, by_no, self.calendar)
-        molds_by_no = {
-            m.mold_no: m for s in self.mold_sets.values() for m in s.molds
+        # 模具的身份是 (套, 模具号)，不是模具号：同一模具号可以出现在两个套里
+        # （V10，引擎按模具号跨组串行）。只按模具号建索引会让后写的套覆盖先写的，
+        # 于是 release_qty 取到另一副模具的配比，与同一份输出的 output_qty、
+        # surplus 自相矛盾。校验器早就是这个双键口径（见 constraint_checker._Context）。
+        molds_by_key = {
+            (s.set_no, m.mold_no): m for s in self.mold_sets.values() for m in s.molds
         }
         release_plan = explain.build_release_plan(
-            assignments, by_no, molds_by_no, self.calendar, batches
+            assignments, by_no, molds_by_key, self.calendar, batches
         )
 
         from verify.constraint_checker import fingerprint  # 避免模块级循环依赖
@@ -483,6 +487,25 @@ class Engine:
                                 "修正产出配比",
                             )
                         )
+
+            # 套内重复模具号：模具号标识一副物理模具，套内出现两次会让 cycles_by_mold
+            # 与 mold_tls 的键冲突——批次模数取自一副模具、工单模数取自另一副，
+            # 选中的配比更低时索引会越过槽位数组末尾。MoldSet.available_molds 已按序
+            # 保留优先级最高的一条，这里把资料问题报出来。
+            by_no: dict[str, list[Mold]] = defaultdict(list)
+            for m in s.molds:
+                by_no[m.mold_no].append(m)
+            for mold_no, dups in sorted(by_no.items()):
+                if len(dups) > 1:
+                    self.exceptions.append(
+                        ExceptionRecord(
+                            "",
+                            "R010",
+                            f"模具套 {s.set_no} 内模具号 {mold_no} 重复 {len(dups)} 次，"
+                            f"已保留优先级最高的一条，其余不参与排程",
+                            "核对模具资料：模具号应唯一标识一副物理模具",
+                        )
+                    )
 
         # V10：同一模具号出现在多个模具套里。模具号标识一副物理模具，而 §5.6 假设
         # 「一副模具同一时刻只能装在一台热压机上」，所以引擎按模具号全局串行（见

@@ -750,6 +750,51 @@ def main() -> int:
           f"（{note45[:40]}…）")
     results.append(case45_ok)
 
+    # 46. 跨套同模具号（V10）：释放计划必须按 (套, 模具号) 取配比。
+    #     此前 molds_by_no 只按模具号建索引，后写的套覆盖先写的，release_qty
+    #     会取到另一副模具的配比，与同一份输出的 output_qty 自相矛盾；
+    #     后写套的模具不覆盖该牌型时还会把整行丢掉。
+    dup_sets = {
+        "S1": MoldSet("S1", "P01", 1, [mold("MX", "S1", 1, {"X": 9})]),
+        "S2": MoldSet("S2", "P01", 2, [mold("MX", "S2", 1, {"X": 2})]),
+    }
+    _, r46 = run_case("跨套同模具号", [
+        WorkOrder("WMX", "SO1", "P01", "X", D(100), "张", date(2026, 2, 10))
+    ], dup_sets, presses)
+    b46 = {b.batch_no: b for b in r46.batches}
+    case46_ok = (
+        bool(r46.assignments)
+        and len(r46.release_plan) == len(r46.assignments)
+        and all(
+            rp.release_qty == b46[rp.batch_no].output_qty.get(rp.pattern_code)
+            for rp in r46.release_plan
+        )
+    )
+    print(f"[{'PASS' if case46_ok else 'FAIL'}] 跨套同模具号：释放量与批次产出同口径"
+          f"（{[(rp.pattern_code, str(rp.release_qty)) for rp in r46.release_plan]}）")
+    results.append(case46_ok)
+
+    # 47. 同一套内重复模具号：模具号标识一副物理模具，套内重复会让 cycles_by_mold
+    #     与 mold_tls 的键冲突——批次模数取自一副、工单模数取自另一副，选中的配比
+    #     更低时索引越过槽位数组末尾（此前直接 IndexError 崩溃）。
+    dup_in_set = MoldSet("S1", "P01", 1, [
+        mold("M1", "S1", 1, {"X": 4}),
+        mold("M1", "S1", 2, {"X": 10}),
+    ])
+    _, r47 = run_case("套内重复模具号", [
+        WorkOrder("WDUP", "SO1", "P01", "X", D(60), "张", date(2026, 2, 10))
+    ], {"S1": dup_in_set}, presses, expect=("R010",))
+    a47 = next((a for a in r47.assignments if a.work_order_no == "WDUP"), None)
+    case47_ok = (
+        a47 is not None
+        and a47.cycles == 15  # 60 / 配比 4（优先级最高那条），不是 60 / 10
+        and len(dup_in_set.available_molds) == 1
+        and any("重复" in e.detail for e in r47.exceptions)
+    )
+    print(f"[{'PASS' if case47_ok else 'FAIL'}] 套内重复模具号：不崩溃、报 R010、"
+          f"保留优先级最高的一条（模数 {a47.cycles if a47 else None}）")
+    results.append(case47_ok)
+
     print()
     print(f"通过 {sum(results)}/{len(results)}")
     return 0 if all(results) else 1

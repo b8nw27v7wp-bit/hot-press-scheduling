@@ -90,14 +90,28 @@ class MoldSet:
 
     @cached_property
     def available_molds(self) -> list[Mold]:
-        return sorted(
+        """套内可用模具，按 (优先级, 模具号) 升序，**模具号唯一**。
+
+        同一模具号在套内出现两次是资料错误：模具号标识一副物理模具，而引擎处处以
+        模具号为键（`Batch.cycles_by_mold`、`mold_tls`），重复项会让批次模数与工单
+        模数取自不同的模具对象，进而索引越界。这里按序保留优先级最高的一条，重复项
+        由 `Engine._validate_resources` 报 R010。
+        """
+        seen: set[str] = set()
+        out: list[Mold] = []
+        for m in sorted(
             (
                 m
                 for m in self.molds
                 if m.status is ResourceStatus.AVAILABLE and m.has_valid_ratios
             ),
             key=lambda m: (m.priority, m.mold_no),
-        )
+        ):
+            if m.mold_no in seen:
+                continue
+            seen.add(m.mold_no)
+            out.append(m)
+        return out
 
     @property
     def mold_count(self) -> int:
