@@ -13,7 +13,6 @@ class Slot:
     index: int
     day: date
     shift: int  # 1-based
-    capacity_per_shift: int
 
 
 class Calendar:
@@ -35,7 +34,7 @@ class Calendar:
                 continue
             if rec.is_working:
                 for s in range(1, rec.shifts + 1):
-                    self._slots.append(Slot(index=idx, day=cur, shift=s, capacity_per_shift=0))
+                    self._slots.append(Slot(index=idx, day=cur, shift=s))
                     idx += 1
             cur += timedelta(days=1)
 
@@ -79,17 +78,3 @@ class Calendar:
             if s.day >= day:
                 return s.index
         return len(self._slots)
-
-    def advance(self, start: int, cycles: int, capacity: int) -> int:
-        """从 start 开始消耗 cycles 模，返回结束槽位（含）。"""
-        if cycles <= 0:
-            return start
-        remaining = cycles
-        s = start
-        while remaining > 0:
-            remaining -= capacity
-            if remaining > 0:
-                s += 1
-        if s >= len(self._slots):
-            raise IndexError("plan exceeds calendar horizon")
-        return s
