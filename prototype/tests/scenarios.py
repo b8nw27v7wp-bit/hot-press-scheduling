@@ -462,6 +462,87 @@ def main() -> int:
     print(f"[{'PASS' if expand_ok else 'FAIL'}] 覆盖不足时按需启用下一套（用到 {sorted(used_sets)}）")
     results.append(expand_ok)
 
+    # 30–33. §10.1 DEMAND_CYCLES_FIRST 选套策略。上面所有用例的套都是同构的
+    #        （副数与配比一致），新旧策略在其上结果相同，因此必须另造异构数据。
+    #        2 台机 → max_groups = 1，只能启用一套，选错即暴露。
+    two = {"R1": Press("R1", 20, "P01"), "R2": Press("R2", 20, "P01")}
+
+    def chosen_set(result):
+        return sorted({a.set_no for a in result.assignments})
+
+    # 30. 副数多但配比低的套 vs 副数少但配比高的套：应按实需模数选后者。
+    #     S_low 需 4×100/2=200 模、并行度 2 → 评分 100；S_high 需 40 模、并行度 1 → 评分 40。
+    s_low = MoldSet("S_low", "P01", 1, [
+        mold("L1", "S_low", 1, {"X": 2}), mold("L2", "S_low", 2, {"X": 2}),
+        mold("L3", "S_low", 3, {"X": 2}),
+    ])
+    s_high = MoldSet("S_high", "P01", 2, [mold("H1", "S_high", 1, {"X": 10})])
+    het_orders = [
+        WorkOrder(f"H{i}", f"SO{i}", "P01", "X", D(100), "张", date(2026, 2, 10))
+        for i in range(1, 5)
+    ]
+    _, r30 = run_case("异构多套：按实需模数选套而非按副数", list(het_orders),
+                      {"S_low": s_low, "S_high": s_high}, two)
+    _, r30b = run_case("异构多套：同输入两次运行一致", list(het_orders),
+                       {"S_low": s_low, "S_high": s_high}, two)
+    sig = lambda r: sorted((a.work_order_no, a.set_no, a.mold_no, a.cycles) for a in r.assignments)
+    case30_ok = chosen_set(r30) == ["S_high"] and all(a.cycles == 10 for a in r30.assignments) and sig(r30) == sig(r30b)
+    print(f"[{'PASS' if case30_ok else 'FAIL'}] 副数少但配比高的套被选中"
+          f"（用到 {chosen_set(r30)}，模数 {[a.cycles for a in r30.assignments]}）")
+    results.append(case30_ok)
+
+    # 31. 配比高但牌型对不上的套不得被选中。两个方向都要防：按副数排序会选中它
+    #     （它有 2 副），按「套内最高配比」排序也会选中它（配比 100 最高）。
+    s_wrong = MoldSet("S_wrong", "P01", 1, [
+        mold("W1", "S_wrong", 1, {"Y": 100}), mold("W2", "S_wrong", 2, {"Y": 100}),
+    ])
+    s_right = MoldSet("S_right", "P01", 2, [mold("Q1", "S_right", 1, {"X": 5})])
+    _, r31 = run_case("配比高但牌型对不上的套不被选中",
+                      [WorkOrder(f"H{i}", f"SO{i}", "P01", "X", D(100), "张", date(2026, 2, 10))
+                       for i in range(1, 5)],
+                      {"S_wrong": s_wrong, "S_right": s_right}, two)
+    case31_ok = (
+        chosen_set(r31) == ["S_right"] and len(r31.assignments) == 4
+        and not any(e.code == "R008" for e in r31.exceptions)
+    )
+    print(f"[{'PASS' if case31_ok else 'FAIL'}] 牌型对不上的高配比套被排除"
+          f"（用到 {chosen_set(r31)}，排程 {len(r31.assignments)}/4）")
+    results.append(case31_ok)
+
+    # 32. 覆盖面窄的高配比套 vs 覆盖面广的低配比套：Y 有需求时应选后者。
+    #     两套副数相同（旧策略按 set_order 会选中 S_narrow），故只有「未覆盖工单数」
+    #     这一维度能区分：选错则 Y 工单因组数上限挡住补套而直接 R008。
+    s_narrow = MoldSet("S_narrow", "P01", 1, [
+        mold("N1", "S_narrow", 1, {"X": 10}), mold("N2", "S_narrow", 2, {"X": 10}),
+    ])
+    s_wide = MoldSet("S_wide", "P01", 2, [
+        mold("D1", "S_wide", 1, {"X": 4, "Y": 4}), mold("D2", "S_wide", 2, {"X": 4, "Y": 4}),
+    ])
+    wide_orders = [
+        WorkOrder("WX1", "SO1", "P01", "X", D(100), "张", date(2026, 2, 10)),
+        WorkOrder("WX2", "SO2", "P01", "X", D(100), "张", date(2026, 2, 10)),
+        WorkOrder("WY1", "SO3", "P01", "Y", D(100), "张", date(2026, 2, 10)),
+        WorkOrder("WY2", "SO4", "P01", "Y", D(100), "张", date(2026, 2, 10)),
+    ]
+    _, r32 = run_case("覆盖面广的套优先于窄覆盖的高配比套", wide_orders,
+                      {"S_narrow": s_narrow, "S_wide": s_wide}, two)
+    case32_ok = (
+        chosen_set(r32) == ["S_wide"] and len(r32.assignments) == 4
+        and not any(e.code == "R008" for e in r32.exceptions)
+    )
+    print(f"[{'PASS' if case32_ok else 'FAIL'}] 窄覆盖高配比套不因覆盖工单少而胜出"
+          f"（用到 {chosen_set(r32)}，排程 {len(r32.assignments)}/4）")
+    results.append(case32_ok)
+
+    # 33. 全部套都覆盖不到待排牌型：评分全为 None，不得抛异常，应走 R008。
+    s_other = MoldSet("S_only", "P01", 1, [mold("O1", "S_only", 1, {"Z": 2})])
+    _, r33 = run_case("全部套覆盖不到待排牌型", [
+        WorkOrder("WZ", "SO1", "P01", "X", D(40), "张", date(2026, 2, 10)),
+    ], {"S_only": s_other}, two, expect=("R008",))
+    case33_ok = not r33.assignments and any(e.code == "R008" for e in r33.exceptions)
+    print(f"[{'PASS' if case33_ok else 'FAIL'}] 无任何套可覆盖时不抛异常并报 R008")
+    results.append(case33_ok)
+
     print()
     print(f"通过 {sum(results)}/{len(results)}")
     return 0 if all(results) else 1

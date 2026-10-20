@@ -569,11 +569,11 @@ class Engine:
         """
         policy = self.params.set_activation_policy
         if policy == "DEMAND_CYCLES_FIRST":
-            scored = [(self._set_score(s, sets, orders), s) for s in sets]
+            scored = [(self._set_score(s, orders), s) for s in sets]
             scored.sort(
                 key=lambda x: (
                     x[0] is None,
-                    x[0] if x[0] is not None else Fraction(0),
+                    x[0] if x[0] is not None else (0, Fraction(0)),
                     -x[1].mold_count,
                     x[1].set_order,
                     x[1].set_no,
@@ -596,41 +596,36 @@ class Engine:
         )
 
     def _set_score(
-        self, s: MoldSet, all_sets: list[MoldSet], orders: list[WorkOrder]
-    ) -> Fraction | None:
-        """§10.1 DEMAND_CYCLES_FIRST：用该套排完本类型待排工单所需的机台模数，
-        除以有效并行度。越小越该优先启用；覆盖不到任何待排牌型的套返回 None。
+        self, s: MoldSet, orders: list[WorkOrder]
+    ) -> tuple[int, Fraction] | None:
+        """§10.1 DEMAND_CYCLES_FIRST 的评分：(未覆盖的待排工单数, 实需机台模数/有效并行度)。
 
-        两处口径必须如此，否则度量会有偏：
+        两个维度按字典序比较，都越小越该优先启用。套内无可用模具时返回 None。
 
-        - 覆盖不到的工单记在「全类型最优配比」上，而不是跳过。若只累加本套能覆盖的
-          工单，覆盖面窄的套累加得少、得分反而低，度量会系统性偏袒窄覆盖的高配比套。
-        - 除以 min(组内机台数, 套内可用副数)：一副模具同一时刻只能装一台机，单副模具
-          的套实际只有 1 台机在跑，不折算会高估其产能（§5.6 有效并行度）。
+        - **未覆盖工单数优先**：组数上限会让 §10.2 的按需补套失效，此时本套覆盖不到的
+          工单会直接落 R008。若按「别的套会承接」来计价，窄覆盖的高配比套会被高估
+          ——实测在 2 台机（只能开 1 组）的类型上，这会选中一个让半数工单排不了的套。
+        - **除以 min(组内机台数, 套内可用副数)**：一副模具同一时刻只能装一台机，单副
+          模具的套实际只有 1 台机在跑，不折算会高估其产能（§5.6 有效并行度）。
         """
-        best_here: dict[str, Decimal] = {}
-        for m in s.available_molds:
-            for p, r in m.ratios.items():
-                if r > best_here.get(p, Decimal(0)):
-                    best_here[p] = r
-        if not any(w.pattern_code in best_here for w in orders):
+        molds = s.available_molds
+        if not molds:
             return None
+        best: dict[str, Decimal] = {}
+        for m in molds:
+            for p, r in m.ratios.items():
+                if r > best.get(p, Decimal(0)):
+                    best[p] = r
 
-        best_anywhere: dict[str, Decimal] = {}
-        for other in all_sets:
-            for m in other.available_molds:
-                for p, r in m.ratios.items():
-                    if r > best_anywhere.get(p, Decimal(0)):
-                        best_anywhere[p] = r
-
+        uncovered = 0
         total = 0
         for w in orders:
-            ratio = best_here.get(w.pattern_code) or best_anywhere.get(w.pattern_code)
+            ratio = best.get(w.pattern_code)
             if ratio is None:
-                continue  # 全类型都无模具覆盖，该工单本就会走 R008
+                uncovered += 1
+                continue
             total += capacity.cycles_for(w.plan_qty, ratio)
-        # 走到这里说明 best_here 非空，即 s.mold_count >= 1，不会除零
-        return Fraction(total, min(self.params.group_size, s.mold_count))
+        return uncovered, Fraction(total, min(self.params.group_size, len(molds)))
 
     def _schedule_type(
         self,
