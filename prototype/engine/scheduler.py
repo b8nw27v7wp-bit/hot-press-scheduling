@@ -73,6 +73,9 @@ class Engine:
         # 批号唯一计数源。曾出现「内层按创建的批次推进、外层按落位的批次推进」
         # 两套计数，一旦有批次排不进去，后面的类型就会复用已用过的批号。
         self._batch_seq = 1
+        # §20.2 的时间预算：由 run() 设置，_schedule_type 在排程过程中读取
+        self._t0: float = perf_counter()
+        self._truncated = False
 
     def _compute_horizon(self) -> date:
         """日历必须覆盖到最晚可能完成日，否则延期工单会被误判为不可排。
@@ -115,6 +118,11 @@ class Engine:
 
     def run(self) -> RunResult:
         t0 = perf_counter()
+        # §20.2 的时间上限必须在排程过程中生效，不能只在产品类型边界检查：
+        # 单个产品类型的工单量可以占满整个预算（实测单类型 3000 单会把 0.05s
+        # 的上限跑到 0.4s 以上而 truncated 仍为 False）。
+        self._t0 = t0
+        self._truncated = False
         self._validate_resources()
         valid = self._preprocess()
 
@@ -140,8 +148,6 @@ class Engine:
         assignments: list[Assignment] = []
         batches: list[Batch] = []
         diagnostics: dict[str, TypeDiagnostics] = {}
-        scheduled_types: set[str] = set()
-        truncated = False
 
         for ptype in sorted(orders_by_type):
             orders = orders_by_type[ptype]
@@ -168,7 +174,7 @@ class Engine:
             g_needed = self._estimate_groups(orders, ordered_sets[0], presses)
 
             if self._time_exceeded(t0):
-                truncated = True
+                self._truncated = True
                 break
 
             result = None
@@ -178,6 +184,9 @@ class Engine:
                 result = self._schedule_type(
                     ptype, orders, sets, presses, g, ordered_sets, g_needed, max_groups
                 )
+                # 已超时：不再加组重试，采纳本次的部分结果
+                if self._truncated:
+                    break
                 # 只有「还会再试一次」时才回收编号；最后一次尝试的结果是要采纳的，
                 # 回收它的编号会让下一个产品类型撞号。
                 last_attempt = idx == len(g_values) - 1
@@ -192,14 +201,17 @@ class Engine:
             self.exceptions.extend(type_exceptions)
             self._reasons.extend(type_reasons)
             diagnostics[ptype] = diag
-            scheduled_types.add(ptype)
 
-        # 超时截断：未排的产品类型必须逐单报异常，不得静默丢弃（§20.2）
-        if truncated:
+        # 超时截断：所有未排入的有效工单必须逐单报异常，不得静默丢弃（§20.2）。
+        # 截断可能发生在某个产品类型**内部**，因此不能只按「未排的类型」报——
+        # 那样已开排但没排完的类型里的剩余工单会被静默丢掉。
+        if self._truncated:
+            scheduled = {a.work_order_no for a in assignments}
+            already = {e.work_order_no for e in self.exceptions}
             for ptype in sorted(orders_by_type):
-                if ptype in scheduled_types:
-                    continue
                 for w in orders_by_type[ptype]:
+                    if w.work_order_no in scheduled or w.work_order_no in already:
+                        continue
                     self.exceptions.append(
                         ExceptionRecord(
                             w.work_order_no,
@@ -268,9 +280,9 @@ class Engine:
                     assignments, batches, order_delivery, release_plan
                 ),
                 "elapsed_seconds": elapsed,
-                "truncated": truncated,
+                "truncated": self._truncated,
                 "performance_note": self._performance_note(
-                    valid, assignments, elapsed, truncated
+                    valid, assignments, elapsed, self._truncated
                 ),
             },
         )
@@ -765,6 +777,10 @@ class Engine:
             }
             placed_batches: list[Batch] = []
             for b in batch_list:
+                # §20.2：时间上限在批次粒度上生效。未落位的工单由 run() 统一报 R007。
+                if self._time_exceeded(self._t0):
+                    self._truncated = True
+                    break
                 batch_due = b_due[b.batch_no]  # 必须在重新分配批号之前取出
                 batch_target_day = capacity.target_finish(batch_due, self.params)
                 target_slot = self.calendar.first_slot_on_or_after(batch_target_day)
@@ -866,5 +882,8 @@ class Engine:
                     )
             # 未落位的批次不进 batch_result：它们没有起止时间，其工单已由 R007 异常报告
             all_batches.extend(placed_batches)
+            if self._truncated:
+                # 已超时：本类型其余组不再开排，保留已落位的部分结果
+                break
 
         return assignments, all_batches, diag, local_exceptions, all_reasons
