@@ -438,6 +438,27 @@ class Engine:
                             )
                         )
 
+        # V10：模具号全局唯一。模具号标识一副物理模具，只能归属一个套。
+        # 模具时间轴是按组建的，同一副模具出现在两个套里时，两组会各建一条时间轴，
+        # 于是同一副模具被同时装到两台机台上（C02 必失败），而此前不会报任何异常。
+        # 此处只报告、不替客户决定归属：按需求第八章，带异常说明的结果比
+        # 表面完整但基于猜测的结果更有价值。
+        by_mold_no: dict[str, list[str]] = defaultdict(list)
+        for s in sorted(self.mold_sets.values(), key=lambda x: x.set_no):
+            for m in sorted(s.molds, key=lambda x: x.mold_no):
+                by_mold_no[m.mold_no].append(s.set_no)
+        for mold_no, set_nos in sorted(by_mold_no.items()):
+            if len(set_nos) > 1:
+                self.exceptions.append(
+                    ExceptionRecord(
+                        "",
+                        "R010",
+                        f"模具 {mold_no} 同时出现在模具套 {'、'.join(set_nos)}，"
+                        f"模具号必须全局唯一，否则同一副模具会被同时排到多台机台",
+                        "核对模具资料，一副模具只归属一个模具套",
+                    )
+                )
+
     def _preprocess(self) -> list[WorkOrder]:
         """P0 校验与预处理（§7）。
 
@@ -471,6 +492,19 @@ class Engine:
                     )
                 )
                 continue
+            # V03 的另一半：交期早于计划起点。仍按最早可行时间排程（§5.5），
+            # 但必须报出来——需求第八章要求这类数据「标记为异常数据并报告，
+            # 不得擅自以默认值替代」，静默 clamp 到计划起点正属该禁止之列。
+            if w.due_date < self.params.plan_start:
+                self.exceptions.append(
+                    ExceptionRecord(
+                        w.work_order_no,
+                        "R010",
+                        f"交期 {w.due_date} 早于计划起点 {self.params.plan_start}，"
+                        f"已按最早可行时间排程，该工单为高风险延期",
+                        "核对客户交期或计划起点后重算",
+                    )
+                )
             if w.plan_qty <= 0:
                 self.exceptions.append(
                     ExceptionRecord(
