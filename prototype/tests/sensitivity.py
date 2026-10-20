@@ -66,7 +66,7 @@ def measure(build_kw: dict | None = None, param_kw: dict | None = None) -> dict:
 
 
 def row(label: str, m: dict) -> str:
-    warn = "" if m["约束失败"] == 0 else f" ⚠{m['约束失败']}"
+    warn = "" if m["约束失败"] == 0 else f" !{m['约束失败']}"
     return (
         f"| {label}{warn} | {m['延期工单']:.0f} | {m['总延期天数']:.0f} | "
         f"{m['延期订单']:.0f} | {m['换模次数']:.0f} | {m['窗口内利用率']:.1%} |"

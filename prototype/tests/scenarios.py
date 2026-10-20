@@ -131,16 +131,16 @@ def main() -> int:
     results.append(one_batch)
 
     # 4. 无模具 → R008
-    _, _ = run_case("无可用模具", [
+    ok4, _ = run_case("无可用模具", [
         WorkOrder("W1", "SO1", "P01", "X", D(10), "张", date(2026, 2, 10))
     ], {}, presses, expect=("R008",))
-    results.append(True)
+    results.append(ok4)
 
     # 5. 无适用机台 → R009
-    _, _ = run_case("无适用机台", [
+    ok5, _ = run_case("无适用机台", [
         WorkOrder("W1", "SO1", "P01", "X", D(10), "张", date(2026, 2, 10))
     ], {"S1": s1}, {}, expect=("R009",))
-    results.append(True)
+    results.append(ok5)
 
     # 6. 空输入 → 空结果
     _, r6 = run_case("空输入", [], {"S1": s1}, presses)
@@ -277,10 +277,10 @@ def main() -> int:
         results.append(ok)
 
     # 20. 交期缺失 → R010
-    _, r20 = run_case("交期缺失", [
+    ok20, r20 = run_case("交期缺失", [
         WorkOrder("WNODUE", "SO1", "P01", "X", D(60), "张", None)
     ], {"S1": s1}, presses, expect=("R010",))
-    results.append(True)
+    results.append(ok20)
 
     # 21. 数量 ≤ 0 → R010（不得静默丢弃）
     _, r21 = run_case("数量非正", [
@@ -331,7 +331,7 @@ def main() -> int:
     print(f"[{'PASS' if no_spurious else 'FAIL'}] 只有唯一覆盖模具时不误报 R003")
     results.append(no_spurious)
 
-    # 25. 订单齐套行内自洽：delay_days 必须等于本行 expected_finish − due_date
+    # 25. 订单齐套行内自洽：delay_days 必须等于本行 expected_finish - due_date
     _, r25 = run_case("订单齐套行内自洽", [
         WorkOrder("WA", "SO-1", "P01", "X", D(100), "张", date(2026, 1, 6)),
         WorkOrder("WB", "SO-1", "P01", "Y", D(400), "张", date(2026, 1, 20)),
@@ -548,6 +548,78 @@ def main() -> int:
     case33_ok = not r33.assignments and any(e.code == "R008" for e in r33.exceptions)
     print(f"[{'PASS' if case33_ok else 'FAIL'}] 无任何套可覆盖时不抛异常并报 R008")
     results.append(case33_ok)
+
+    # 34. §21.1 U08 组数上限：g ≤ min(套数, 机台数 / 每组机台数)。
+    #     4 套模具、4 台机、每组 2 台 → 上限必须收敛到 2 组而不是 4 组；
+    #     判据写错会让 §13.3 的资源归因指向错误的瓶颈（把「机台数封顶」说成套数封顶）。
+    four_presses = {f"R{i}": Press(f"R{i}", 20, "P01") for i in range(1, 5)}
+    four_sets = {
+        f"T{i}": MoldSet(f"T{i}", "P01", i, [mold(f"P{i}", f"T{i}", 1, {"X": 4, "Y": 4})])
+        for i in range(1, 5)
+    }
+    _, r34 = run_case("组数上限 = min(套数, 机台数/每组台数)", [
+        WorkOrder(f"WG{i}", f"SO{i}", "P01", "X", D(200), "张", date(2026, 2, 10))
+        for i in range(1, 9)
+    ], four_sets, four_presses)
+    d34 = r34.diagnostics["P01"]
+    expected_cap = min(len(four_sets), len(four_presses) // 2)
+    case34_ok = (
+        d34.max_groups == expected_cap
+        and all(d.groups_used <= expected_cap for d in r34.diagnostics.values())
+    )
+    print(f"[{'PASS' if case34_ok else 'FAIL'}] 组数上限 = min(套数, 机台数/每组台数)"
+          f"（max_groups={d34.max_groups} 应为 {expected_cap}，groups_used={d34.groups_used}）")
+    results.append(case34_ok)
+
+    # 35. §20.2 时间上限：置 truncated，且未排入的有效工单逐条报 R007，不得静默丢弃。
+    #     截断可能落在「产品类型边界」或「类型内部的批次循环」，落位多少张取决于机器速度，
+    #     故只断言 §20.2 的契约本身，不断言已排张数。
+    big_orders = [
+        WorkOrder(f"WT{i:04d}", f"ST{i % 40:03d}", "P01", "X" if i % 2 else "Y",
+                  D(300), "张", date(2026, 2, 10))
+        for i in range(3000)
+    ]
+    ok35, r35 = run_case("时间上限截断（§20.2）", big_orders, {"S1": s1}, presses,
+                         time_limit_seconds=0.05, expect=("R007",))
+    sched35 = {a.work_order_no for a in r35.assignments}
+    rep35 = {e.work_order_no for e in r35.exceptions if e.code == "R007"}
+    unplaced35 = {w.work_order_no for w in big_orders} - sched35
+    case35_ok = ok35 and r35.meta["truncated"] and not (unplaced35 - rep35)
+    print(f"[{'PASS' if case35_ok else 'FAIL'}] 超时截断：truncated={r35.meta['truncated']}，"
+          f"已排 {len(sched35)} 张，未排 {len(unplaced35)} 张全部报 R007"
+          f"={not (unplaced35 - rep35)}")
+    results.append(case35_ok)
+
+    # 36. 模具号跨套重复（同一副物理模具出现在两个套里）：必须报输入异常，
+    #     不得静默产出「同一副模具同时装在两台机台」的物理不可能结果。
+    dup_sets = {
+        "S1": MoldSet("S1", "P01", 1, [mold("MX", "S1", 1, {"X": 2}),
+                                       mold("M1", "S1", 2, {"X": 2})]),
+        "S2": MoldSet("S2", "P01", 2, [mold("MX", "S2", 1, {"X": 2}),
+                                       mold("M2", "S2", 2, {"X": 2})]),
+    }
+    r36 = build([WorkOrder("WD1", "SO1", "P01", "X", D(200), "张", date(2026, 2, 10))],
+                dup_sets, presses).run()
+    dup_exc = [e for e in r36.exceptions if e.code == "R010" and "MX" in e.detail]
+    case36_ok = bool(dup_exc) and "S1" in dup_exc[0].detail and "S2" in dup_exc[0].detail
+    print(f"[{'PASS' if case36_ok else 'FAIL'}] 跨套重复模具号报 R010"
+          f"（{'已报' if dup_exc else '未报'}）")
+    results.append(case36_ok)
+
+    # 37. V03 的另一半：交期早于计划起点时必须报 R010（且仍按最早可行时间排程）。
+    #     此前只实现了「交期缺失」，早于计划起点会被 target_finish 静默钳到计划起点，
+    #     既不报异常也不留痕，违反需求第八章「标记为异常数据并报告」。
+    early_due = PLAN_START - timedelta(days=10)
+    _, r37 = run_case("交期早于计划起点", [
+        WorkOrder("WEARLY", "SO1", "P01", "X", D(60), "张", early_due)
+    ], {"S1": s1}, presses, expect=("R010",))
+    early_reported = [
+        e for e in r37.exceptions if e.work_order_no == "WEARLY" and e.code == "R010"
+    ]
+    case37_ok = bool(early_reported) and len(r37.assignments) == 1
+    print(f"[{'PASS' if case37_ok else 'FAIL'}] 交期早于计划起点报 R010 且仍排程"
+          f"（{'已报' if early_reported else '未报'}，排程 {len(r37.assignments)} 张）")
+    results.append(case37_ok)
 
     print()
     print(f"通过 {sum(results)}/{len(results)}")
