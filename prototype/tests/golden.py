@@ -4,11 +4,18 @@
 真实规模的固定数据集跑通全流程，并对若干「人工可核对」的关键工单做硬断言。
 数据集完全确定（固定种子），因此结果可复现、可回归。
 
-用法： py tests/golden.py
+**外部基线**：结果指纹与延期指标写入 `tests/fixtures/golden_baseline.json` 并逐项断言。
+只比较「同进程两次运行」测不出「改动是否改变了结果」——两次运行用的是同一份代码，
+一起变也一致。基线文件是唯一的跨版本对照点。
+
+用法：
+  py tests/golden.py                   # 与基线比对
+  py tests/golden.py --update-baseline # 结果确实应当变化时，重新生成基线
 """
 
 from __future__ import annotations
 
+import json
 import random
 import sys
 from datetime import date, timedelta
@@ -39,6 +46,7 @@ from verify.constraint_checker import (  # noqa: E402
 PLAN_START = date(2026, 1, 5)
 SEED = 20260105
 D = Decimal
+BASELINE_PATH = Path(__file__).resolve().parent / "fixtures" / "golden_baseline.json"
 
 # 每个产品类型的（机台数, 模具套数, 每套副数）
 LAYOUT = {
@@ -149,7 +157,23 @@ def build():
     return params, product_types, mold_sets, presses, calendar_days, orders
 
 
+def measure(result, presses) -> dict:
+    """基线里记录的、跨版本可比的结果指标（§21.3 黄金数据集比对）。"""
+    stats = summarize(result.assignments, result.batches, presses, result.calendar)
+    return {
+        "result_hash": fingerprint(
+            result.assignments, result.batches, result.order_delivery, result.release_plan
+        ),
+        "delayed_work_orders": stats["delayed_work_orders"],
+        "total_delay_days": stats["total_delay_days"],
+        "batches": len(result.batches),
+        "release_plan_rows": len(result.release_plan),
+        "changeover_count": stats["changeover_count"],
+    }
+
+
 def main() -> int:
+    update = "--update-baseline" in sys.argv
     params, product_types, mold_sets, presses, calendar_days, orders = build()
     engine = Engine(params, product_types, mold_sets, presses, calendar_days, orders)
     result = engine.run()
@@ -272,6 +296,46 @@ def main() -> int:
         len(result.release_plan) == len(result.assignments),
         f"{len(result.release_plan)} vs {len(result.assignments)}",
     ))
+
+    # 11. §21.3 黄金数据集比对：与外部基线逐项比对
+    current = measure(result, presses)
+    if update:
+        baseline_doc = {
+            "_comment": (
+                "§21.3「黄金数据集比对」的外部基线。由 `py tests/golden.py "
+                "--update-baseline` 生成；改动算法后若结果确实应当变化，"
+                "重新生成并在此处 review 差异。"
+            ),
+            "dataset": {
+                "seed": SEED,
+                "work_orders": len(orders),
+                "product_types": len(product_types),
+                "presses": len(presses),
+                "molds": n_molds,
+                "mold_sets": len(mold_sets),
+            },
+            **current,
+        }
+        BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        BASELINE_PATH.write_text(
+            json.dumps(baseline_doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        print(f"已更新基线：{BASELINE_PATH}")
+    elif not BASELINE_PATH.exists():
+        checks.append((
+            f"黄金数据集基线存在（{BASELINE_PATH.name}）",
+            False,
+            "基线缺失，请先跑 `py tests/golden.py --update-baseline` 并 review 后提交",
+        ))
+    else:
+        baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+        for key, got in current.items():
+            want = baseline.get(key)
+            checks.append((
+                f"基线比对 {key}",
+                got == want,
+                f"当前 {got}" + ("" if got == want else f"，基线 {want}"),
+            ))
 
     for name, ok, detail in checks:
         suffix = f"  （{detail}）" if detail else ""

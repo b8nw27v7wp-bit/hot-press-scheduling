@@ -134,6 +134,63 @@ def build_dataset():
     return params, product_types, {"S1": s1, "S2": s2, "S3": s3}, presses, calendar_days, orders
 
 
+def build_changeover_dataset():
+    """专门逼出真实换模的小数据集，供 C08 用。
+
+    主数据集里换模次数恒为 0：每副模具都覆盖 X+Y（或该牌型独占一台机），
+    调度器按模具把工单分派开，同一台机上不会出现前后两批用不同模具。
+    而 C08 只在「同一机台前后两批用不同模具」时才可能报错——换模为 0 时
+    它是空跑，此时的「全部通过」不能当作 C08 的证据。
+
+    这里的做法：一副模具只覆盖一个牌型 + `group_size=1`（每台机自成一组、
+    各绑一套模具），同一台机上必然出现 X/Y 交替 → 真实换模。
+    """
+    plan_start = date(2026, 1, 5)
+    params = Params(
+        plan_start=plan_start,
+        group_size=1,
+        pre_offset_days=15,
+        shift_hours=12,
+        changeover_hours=2,
+    )
+
+    def mold(no, set_no, prio, pattern):
+        return Mold(
+            mold_no=no,
+            set_no=set_no,
+            mold_type=MoldType.MULTI,
+            priority=prio,
+            ratios={pattern: Decimal("2")},
+        )
+
+    mold_sets = {
+        "S1": MoldSet("S1", "P01", 1, [mold("M1", "S1", 1, "X"), mold("M2", "S1", 2, "Y")]),
+        "S2": MoldSet("S2", "P01", 2, [mold("M3", "S2", 1, "X"), mold("M4", "S2", 2, "Y")]),
+    }
+    presses = {"R1": Press("R1", 20, "P01"), "R2": Press("R2", 20, "P01")}
+
+    calendar_days = {}
+    cur = plan_start
+    while cur <= plan_start + timedelta(days=120):
+        if cur.weekday() < 5:
+            calendar_days[cur] = CalendarDay(cur, shifts=2, is_holiday=False)
+        cur += timedelta(days=1)
+
+    orders = [
+        WorkOrder(
+            work_order_no=f"WC{i:03d}",
+            sales_order_no=f"SO-{i:02d}",
+            product_type_code="P01",
+            pattern_code="X" if i % 2 else "Y",
+            qty=Decimal("60"),
+            uom="张",
+            due_date=date(2026, 2, 10),
+        )
+        for i in range(1, 21)
+    ]
+    return params, mold_sets, presses, calendar_days, orders
+
+
 def main():
     params, product_types, mold_sets, presses, calendar_days, orders = build_dataset()
     engine = Engine(params, product_types, mold_sets, presses, calendar_days, orders)
@@ -184,6 +241,29 @@ def main():
         f"（{stats['used_cycles']}/{stats['available_cycles']} 模）"
         f"  换模 {stats['changeover_count']} 次  超产 {stats['surplus_qty']}"
     )
+    # C08 覆盖：主数据集换模次数恒为 0（调度器按模具把工单分派开），
+    # 单独用 build_changeover_dataset 逼出真实换模，否则本文件打印的
+    # 「C01–C15 全部通过」对 C08 是无意义的空跑。
+    co_params, co_sets, co_presses, co_cal, co_orders = build_changeover_dataset()
+    co = Engine(co_params, product_types, co_sets, co_presses, co_cal, co_orders).run()
+    co_errors = check_all(
+        co.assignments,
+        co.batches,
+        {w.work_order_no: w for w in co_orders},
+        co_presses,
+        co.calendar,
+        co_sets,
+        co_params,
+        reported={e.work_order_no for e in co.exceptions},
+    )
+    co_changes = summarize(
+        co.assignments, co.batches, co_presses, co.calendar
+    )["changeover_count"]
+    errors += co_errors
+    if co_changes == 0:
+        errors.append(
+            "C08 空跑：换模专用数据集也没产生换模，无法证明换模折算被校验。"
+        )
     print()
     print("订单齐套与延期 (§4.3):")
     for o in result.order_delivery:
@@ -207,12 +287,15 @@ def main():
     ):
         print(f"  {label}: {text}")
     print()
+    print(f"换模覆盖数据集：排程 {len(co.assignments)} 张，换模 {co_changes} 次，"
+          f"约束错误 {len(co_errors)} 项")
+    print()
     if errors:
         print("约束校验失败：")
         for e in errors:
             print("  -", e)
         return 1
-    print("约束校验全部通过 (C01-C15)")
+    print("约束校验全部通过 (C01-C15，含真实换模的 C08)")
     return 0
 
 

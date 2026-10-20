@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
+import os
 import random
+import subprocess
 import sys
 from dataclasses import replace
 from decimal import Decimal
@@ -69,6 +71,25 @@ def groups_signature(result) -> dict:
 
 def groups_estimate(result) -> dict:
     return {t: d.groups_needed for t, d in sorted(result.diagnostics.items())}
+
+
+def hash_across_processes(seeds: tuple[str, ...]) -> dict[str, str]:
+    """在各自独立的子进程里、用不同的 PYTHONHASHSEED 跑一遍，收集结果指纹。
+
+    同进程重复调用时哈希种子固定，`set`/`dict` 的遍历顺序两次必然相同，
+    因此那种写法根本测不出「引擎是否依赖哈希顺序」。§16.1 要求「所有集合
+    遍历前排序」，这条断言才是它的可执行证据。
+    """
+    probe = Path(__file__).resolve().parent / "hash_probe.py"
+    out: dict[str, str] = {}
+    for seed in seeds:
+        env = {**os.environ, "PYTHONHASHSEED": seed}
+        proc = subprocess.run(
+            [sys.executable, str(probe)],
+            capture_output=True, text=True, env=env, check=False,
+        )
+        out[seed] = proc.stdout.strip() if proc.returncode == 0 else f"<失败 rc={proc.returncode}>"
+    return out
 
 
 def main() -> int:
@@ -139,6 +160,18 @@ def main() -> int:
         == fingerprint(again.assignments, again.batches, again.order_delivery,
                        again.release_plan),
         "",
+    ))
+
+    # §16.1 确定性：跨进程 + 跨 PYTHONHASHSEED 的指纹必须一致。
+    # 上面那条「两次运行一致」是在同一个进程里比的，哈希种子相同，
+    # 对「遍历顺序是否影响结果」没有证明力。
+    seeds = ("0", "1", "12345")
+    hashes = hash_across_processes(seeds)
+    distinct = set(hashes.values())
+    checks.append((
+        f"跨进程 + 不同 PYTHONHASHSEED（{len(seeds)} 个）结果指纹一致",
+        len(distinct) == 1 and "<失败" not in next(iter(distinct)),
+        " / ".join(f"{s}:{h[:12]}" for s, h in hashes.items()),
     ))
 
     print()

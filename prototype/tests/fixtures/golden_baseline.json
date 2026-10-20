@@ -1,0 +1,17 @@
+{
+  "_comment": "§21.3「黄金数据集比对」的外部基线。由 `py tests/golden.py --update-baseline` 生成；改动算法后若结果确实应当变化，重新生成并在此处 review 差异。",
+  "dataset": {
+    "seed": 20260105,
+    "work_orders": 500,
+    "product_types": 3,
+    "presses": 10,
+    "molds": 20,
+    "mold_sets": 10
+  },
+  "result_hash": "d6b0245cbac445f15d92a03e0a2cd96046e46a59477544ecffbfd07a008edd15",
+  "delayed_work_orders": 60,
+  "total_delay_days": 636,
+  "batches": 426,
+  "release_plan_rows": 500,
+  "changeover_count": 0
+}

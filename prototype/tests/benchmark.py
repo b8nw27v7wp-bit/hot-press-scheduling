@@ -27,6 +27,11 @@ from verify.constraint_checker import check_all, summarize  # noqa: E402
 PLAN_START = date(2026, 1, 5)
 SEED = 20260105
 
+# §19 规模估算：「组数迭代最多 3 次，总时长 < 15 秒」。§21.3 把「全量排程限时」
+# 列为验收项，本文件据此把它做成可判定的断言——只打印耗时的话，除约束失败外
+# 恒 rc=0，退化到 14 秒也不会让任何流程失败。实测约 0.8s，留了约 18 倍余量。
+FULL_RUN_LIMIT_SECONDS = 15.0
+
 
 def build(
     n_orders: int = 10000,
@@ -157,13 +162,41 @@ def main() -> int:
           f"（分母为各类型交期窗口内的机台产能，判断产能是否富余看这个）")
     print(f"换模 {stats['changeover_count']} 次  超产 {stats['surplus_qty']}")
     print(f"计算耗时 {elapsed:.2f}s  校验耗时 {check_elapsed:.2f}s")
+
+    checks: list[tuple[str, bool, str]] = []
+    checks.append(("约束 C01–C15 全部通过", not errors, f"{len(errors)} 项失败"))
+    checks.append((
+        f"全量排程限时 ≤ {FULL_RUN_LIMIT_SECONDS:.0f}s（§19、§21.3）",
+        elapsed <= FULL_RUN_LIMIT_SECONDS,
+        f"{elapsed:.2f}s",
+    ))
+    checks.append((
+        "未触发时间上限截断（truncated=false）",
+        result.meta.get("truncated") is False,
+        f"truncated={result.meta.get('truncated')}",
+    ))
+    # 本数据集只缺周日（build 里 weekday() < 6），因此 R011 是预期内的日历缺失报告；
+    # 真正要断言的是「没有工单级异常」——即没有任何工单被跳过。
+    order_level = [e for e in result.exceptions if e.work_order_no]
+    checks.append((
+        "全部工单排入，无工单级异常",
+        len(result.assignments) == len(orders) and not order_level,
+        f"排程 {len(result.assignments)}/{len(orders)}，"
+        f"工单级异常 {len(order_level)}，日历缺失 {len(result.exceptions) - len(order_level)}",
+    ))
+
+    print()
+    for name, ok, detail in checks:
+        print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  （{detail}）" if detail else ""))
+    failed = sum(1 for _, ok, _ in checks if not ok)
+    print()
+    print(f"通过 {len(checks) - failed}/{len(checks)}")
+
     if errors:
-        print(f"约束失败 {len(errors)} 项：")
+        print("约束失败：")
         for e in errors[:10]:
             print("  -", e)
-        return 1
-    print("约束校验全部通过")
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

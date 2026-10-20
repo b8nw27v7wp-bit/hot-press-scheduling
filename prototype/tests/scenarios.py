@@ -654,6 +654,102 @@ def main() -> int:
     print(f"[{'PASS' if param_ok else 'FAIL'}] 非法参数明确失败（{len(bad_params)} 项）")
     results.append(param_ok)
 
+    # 39. V04 产品类型未定义：工单挂在一个 product_types 里没有的类型上。
+    #     实测该分支可达——不补用例时，V04 只靠「设计文档说实现了」来担保。
+    _, r39 = run_case("V04 产品类型未定义", [
+        WorkOrder("WV04", "SO1", "P99", "X", D(60), "张", date(2026, 2, 10))
+    ], {"S1": s1}, presses, expect=("R010",))
+    case39_ok = not r39.assignments and any(
+        e.work_order_no == "WV04" and e.code == "R010" for e in r39.exceptions
+    )
+    print(f"[{'PASS' if case39_ok else 'FAIL'}] V04 产品类型未定义报 R010 且不排程"
+          f"（排程 {len(r39.assignments)} 张）")
+    results.append(case39_ok)
+
+    # 40. V05 牌型缺失：pattern_code 为空串时无法匹配任何模具。
+    _, r40 = run_case("V05 牌型缺失", [
+        WorkOrder("WV05", "SO1", "P01", "", D(60), "张", date(2026, 2, 10))
+    ], {"S1": s1}, presses, expect=("R010",))
+    case40_ok = not r40.assignments and any(
+        e.work_order_no == "WV05" and e.code == "R010" for e in r40.exceptions
+    )
+    print(f"[{'PASS' if case40_ok else 'FAIL'}] V05 牌型缺失报 R010 且不排程"
+          f"（排程 {len(r40.assignments)} 张）")
+    results.append(case40_ok)
+
+    # 41. V06 机台无适用产品类型：机台挂在一个未定义的产品类型上。
+    bad_presses = {
+        "R1": Press("R1", 20, "P01"),
+        "RX": Press("RX", 20, "P99"),
+    }
+    _, r41 = run_case("V06 机台适用类型未定义", [
+        WorkOrder("WV06", "SO1", "P01", "X", D(60), "张", date(2026, 2, 10))
+    ], {"S1": s1}, bad_presses, expect=("R009",))
+    case41_ok = any(
+        e.code == "R009" and "RX" in e.detail for e in r41.exceptions
+    ) and all(a.press_no != "RX" for a in r41.assignments)
+    print(f"[{'PASS' if case41_ok else 'FAIL'}] V06 未定义类型的机台报 R009 且不参与分配"
+          f"（排程机台 {sorted({a.press_no for a in r41.assignments})}）")
+    results.append(case41_ok)
+
+    # 42. V07 配比缺失/非正：该模具不可用（否则模数计算会除零或得出负模数）。
+    bad_molds = MoldSet("S1", "P01", 1, [
+        mold("M0", "S1", 1, {"X": 0}),      # 配比非正
+        mold("M1", "S1", 2, {}),            # 配比缺失
+        mold("M2", "S1", 3, {"X": 2}),      # 唯一可用
+    ])
+    _, r42 = run_case("V07 配比缺失/非正", [
+        WorkOrder("WV07", "SO1", "P01", "X", D(60), "张", date(2026, 2, 10))
+    ], {"S1": bad_molds}, presses, expect=("R010",))
+    used = {a.mold_no for a in r42.assignments}
+    case42_ok = (
+        {"M0", "M1"} <= {e.detail.split()[1] for e in r42.exceptions if e.code == "R010"}
+        and used == {"M2"}
+    )
+    print(f"[{'PASS' if case42_ok else 'FAIL'}] V07 配比非正/缺失的模具报 R010 且被排除"
+          f"（实际用模具 {sorted(used)}）")
+    results.append(case42_ok)
+
+    # 43. V09 套/模具引用不符：模具记录的 set_no 与它实际所在的套不一致。
+    mismatch = MoldSet("S9", "P01", 1, [
+        mold("M9", "S_OTHER", 1, {"X": 2}),
+    ])
+    _, r43 = run_case("V09 模具与套引用不符", [
+        WorkOrder("WV09", "SO1", "P01", "X", D(60), "张", date(2026, 2, 10))
+    ], {"S9": mismatch}, presses, expect=("R010",))
+    case43_ok = any("不符" in e.detail for e in r43.exceptions if e.code == "R010")
+    print(f"[{'PASS' if case43_ok else 'FAIL'}] V09 模具套引用不符报 R010")
+    results.append(case43_ok)
+
+    # 44. R012 尾数超产（§15 8.9）：qty 不能被配比整除时必然超产。
+    #     此前引擎会 emit R012，但 tests/ 里零引用——没有任何断言证明它真的出现。
+    _, r44 = run_case("R012 尾数超产", [
+        WorkOrder("WSUR", "SO1", "P01", "X", D(61), "张", date(2026, 2, 10))
+    ], {"S1": s1}, presses)
+    a44 = next((a for a in r44.assignments if a.work_order_no == "WSUR"), None)
+    b44 = next((b for b in r44.batches if a44 and b.batch_no == a44.batch_no), None)
+    case44_ok = (
+        a44 is not None
+        and "R012" in a44.reason_codes
+        and b44 is not None
+        and b44.surplus.get("X", D(0)) > 0
+    )
+    print(f"[{'PASS' if case44_ok else 'FAIL'}] R012 尾数超产进 reason_codes 且批次报超产量"
+          f"（超产 {b44.surplus if b44 else None}）")
+    results.append(case44_ok)
+
+    # 45. §15 8.10 性能退化报告：完成计算时必须给出规模与耗时结论。
+    _, r45 = run_case("§8.10 性能报告", [
+        WorkOrder(f"WP{i:03d}", f"SO{i % 3}", "P01", "X" if i % 2 else "Y",
+                  D(60), "张", date(2026, 2, 10))
+        for i in range(1, 41)
+    ], {"S1": s1}, presses)
+    note45 = r45.meta.get("performance_note", "")
+    case45_ok = bool(note45) and r45.meta.get("truncated") is False
+    print(f"[{'PASS' if case45_ok else 'FAIL'}] §8.10 输出性能说明且未截断"
+          f"（{note45[:40]}…）")
+    results.append(case45_ok)
+
     print()
     print(f"通过 {sum(results)}/{len(results)}")
     return 0 if all(results) else 1
