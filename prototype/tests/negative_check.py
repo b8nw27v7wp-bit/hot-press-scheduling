@@ -243,6 +243,55 @@ def main():
     report("BATCHREF", any(x.startswith("C15") for x in e),
            f"assignment.batch_no 指向不存在批次 -> {e}")
 
+    # ---------------- 回归：校验器自身的判据缺陷 ----------------
+    # 以下四项曾经「假通过」或「假失败」，用最小数据锁住，防止判据再被改回。
+    print()
+    print("== 回归：校验器判据缺陷 ==")
+
+    # (1) C06 曾只比较排序后的相邻对：组0 的区间若被同组批次夹住，
+    #     它与组1 的重叠就看不见了。
+    bI = Batch("BI", "SO1", 0, "S1", "M1", "R1", [], set(), 0, {}, 0, 5, 0)
+    bJ = Batch("BJ", "SO1", 0, "S1", "M1", "R3", [], set(), 0, {}, 1, 2, 0)
+    bK = Batch("BK", "SO1", 1, "S1", "M2", "R2", [], set(), 0, {}, 3, 8, 0)
+    presses4 = {"R1": presses["R1"], "R2": Press("R2", 10, "P01"),
+                "R3": Press("R3", 10, "P01")}
+    e = run([], [bI, bJ, bK], {}, presses4, sets, params)
+    report("C06-gap", any(x.startswith("C06") for x in e),
+           f"组0/组1 重叠但中间夹着同组批次（非相邻对）-> {e}")
+
+    # (2) C03 曾只遍历 assignments：批次表越界、为 -1 都不报。
+    b = copy.deepcopy(res.batches)
+    b[0].end_slot = len(mk_cal(params)) + 9
+    e = run(res.assignments, b, orders, presses, sets, params)
+    report("C03-batch", any(x.startswith("C03") for x in e),
+           f"批次 {b[0].batch_no} end_slot 越界（assignment 正常）-> {e}")
+
+    b = copy.deepcopy(res.batches)
+    b[0].start_slot = -1
+    e = run(res.assignments, b, orders, presses, sets, params)
+    report("C03-batch-neg", any(x.startswith("C03") for x in e),
+           f"批次 {b[0].batch_no} start_slot=-1 -> {e}")
+
+    # (3) C15 曾只比对工单清单：两表的机台归属不一致也不报。
+    presses5 = {"R1": presses["R1"], "R2": Press("R2", 10, "P01")}
+    a = copy.deepcopy(res.assignments)
+    a[0].press_no = "R2"
+    e = run(a, res.batches, orders, presses5, sets, params)
+    report("C15-press", any("press_no" in x for x in e),
+           f"assignment 与所属批次的机台归属不一致 -> {e}")
+
+    # (4) C08 曾用浮点算换模折算值，把合规结果判为违规。
+    #     changeover_hours=7、shift_hours=12、cap=108 时，整数上取整为 63，
+    #     而 7/12*108 的浮点结果是 63.000000000000007，取整得 64。
+    p7 = Params(plan_start=PLAN_START, changeover_hours=7, shift_hours=12)
+    r108 = {"R1": Press("R1", 108, "P01")}
+    chg = -(-(p7.changeover_hours * 108) // p7.shift_hours)
+    bL = Batch("BL", "SO1", 0, "S1", "M1", "R1", [], set(), 0, {}, 0, 0, 0)
+    bM = Batch("BM", "SO1", 0, "S1", "M2", "R1", [], set(), 0, {}, 1, 1, chg)
+    e = run([], [bL, bM], {}, r108, sets, p7)
+    report("C08-int", not any(x.startswith("C08") for x in e),
+           f"换模折算 {chg} 模（整数上取整）不得被判为违规 -> {e}")
+
     print()
     print("== 可达性 / 排序 / 退化 深度分析 ==")
     reachability_and_ordering()
@@ -253,7 +302,9 @@ def main():
     print(f"通过 {len(PASS)}/{len(PASS) + len(FAIL)}")
     if FAIL:
         print("未触发：", FAIL)
-    return 0
+    # 本文件的全部价值就是「确认每条检查真的会报警」；有未触发项却返回 0，
+    # 等于把校验器失效伪装成通过。
+    return 0 if not FAIL else 1
 
 
 def _big_run():
