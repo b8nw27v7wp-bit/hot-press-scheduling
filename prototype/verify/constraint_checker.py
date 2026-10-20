@@ -61,9 +61,17 @@ class _Context:
         self.calendar = calendar
         self.mold_sets = mold_sets
         self.params = params
-        self.mold_index: dict[str, tuple[MoldSet, Mold]] = {
-            m.mold_no: (s, m) for s in mold_sets.values() for m in s.molds
+        # 模具的身份是 (套, 模具号)，不是模具号：同一模具号可以出现在两个套里
+        # （引擎按 §5.6 把它跨组串行）。若只按模具号建索引，后写的套会覆盖先写的，
+        # 于是排在某套里的模具会被判成「不属于该套」而误报 C05。
+        self.mold_index: dict[tuple[str, str], tuple[MoldSet, Mold]] = {
+            (s.set_no, m.mold_no): (s, m) for s in mold_sets.values() for m in s.molds
         }
+        # 供「找不到」时区分「模具号不存在」与「模具号存在但不在该套里」
+        self.sets_of_mold: dict[str, list[str]] = defaultdict(list)
+        for s in mold_sets.values():
+            for m in s.molds:
+                self.sets_of_mold[m.mold_no].append(s.set_no)
 
 
 def check_all(
@@ -173,17 +181,19 @@ def _check_mold_belongs_to_type(ctx: _Context) -> list[str]:
     """模具必须存在、可用，且属于该工单产品类型下的模具套。"""
     errs = []
     for a in ctx.assignments:
-        entry = ctx.mold_index.get(a.mold_no)
+        entry = ctx.mold_index.get((a.set_no, a.mold_no))
         if entry is None:
-            errs.append(f"C05 工单 {a.work_order_no} 引用了不存在的模具 {a.mold_no}")
+            if a.mold_no in ctx.sets_of_mold:
+                errs.append(
+                    f"C05 工单 {a.work_order_no} 的模具 {a.mold_no} 不属于模具套 {a.set_no}"
+                    f"（该模具号属于 {'、'.join(sorted(ctx.sets_of_mold[a.mold_no]))}）"
+                )
+            else:
+                errs.append(f"C05 工单 {a.work_order_no} 引用了不存在的模具 {a.mold_no}")
             continue
         mold_set, mold = entry
         if mold.status is not ResourceStatus.AVAILABLE:
             errs.append(f"C05 工单 {a.work_order_no} 使用了非可用模具 {a.mold_no}（{mold.status.value}）")
-        if mold_set.set_no != a.set_no:
-            errs.append(
-                f"C05 工单 {a.work_order_no} 的模具 {a.mold_no} 不属于模具套 {a.set_no}"
-            )
         if mold_set.product_type_code != a.product_type_code:
             errs.append(
                 f"C05 工单 {a.work_order_no} 使用了产品类型 {mold_set.product_type_code} 的模具套 "
@@ -232,9 +242,11 @@ def _check_batch_cycles(ctx: _Context) -> list[str]:
     """以完整模具生产：批次模数 = max 工单模数。"""
     errs = []
     for b in ctx.batches:
-        entry = ctx.mold_index.get(b.mold_no)
+        entry = ctx.mold_index.get((b.set_no, b.mold_no))
         if entry is None:
-            errs.append(f"C07 批次 {b.batch_no} 引用了不存在的模具 {b.mold_no}")
+            errs.append(
+                f"C07 批次 {b.batch_no} 在模具套 {b.set_no} 中找不到模具 {b.mold_no}"
+            )
             continue
         _, mold = entry
         expected = 0
@@ -354,7 +366,7 @@ def _check_quantity(ctx: _Context) -> list[str]:
     """每张工单 cycles × ratio ≥ qty，且不超过 qty + ratio（即向上取整的紧界）。"""
     errs = []
     for a in ctx.assignments:
-        entry = ctx.mold_index.get(a.mold_no)
+        entry = ctx.mold_index.get((a.set_no, a.mold_no))
         if entry is None:
             continue  # C05 已报
         _, mold = entry

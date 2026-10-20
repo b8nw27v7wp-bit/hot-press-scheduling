@@ -450,11 +450,11 @@ class Engine:
                             )
                         )
 
-        # V10：模具号全局唯一。模具号标识一副物理模具，只能归属一个套。
-        # 模具时间轴是按组建的，同一副模具出现在两个套里时，两组会各建一条时间轴，
-        # 于是同一副模具被同时装到两台机台上（C02 必失败），而此前不会报任何异常。
-        # 此处只报告、不替客户决定归属：按需求第八章，带异常说明的结果比
-        # 表面完整但基于猜测的结果更有价值。
+        # V10：同一模具号出现在多个模具套里。模具号标识一副物理模具，而 §5.6 假设
+        # 「一副模具同一时刻只能装在一台热压机上」，所以引擎按模具号全局串行（见
+        # _schedule_type 里 mold_tls 的建法），结果不会违反 C02。
+        # 仍然报出来：模具资料把同一副模具挂在两个套上，多半是主数据要核对的情形，
+        # 客户需要知道产能因此被两个组共享。
         by_mold_no: dict[str, list[str]] = defaultdict(list)
         for s in sorted(self.mold_sets.values(), key=lambda x: x.set_no):
             for m in sorted(s.molds, key=lambda x: x.mold_no):
@@ -466,8 +466,9 @@ class Engine:
                         "",
                         "R010",
                         f"模具 {mold_no} 同时出现在模具套 {'、'.join(set_nos)}，"
-                        f"模具号必须全局唯一，否则同一副模具会被同时排到多台机台",
-                        "核对模具资料，一副模具只归属一个模具套",
+                        f"已按「一副模具同一时刻只在一台机台」跨组串行，"
+                        f"其产能由这些组共享",
+                        "核对模具资料；若该模具确实归属多个套，请确认产能共享符合现场",
                     )
                 )
 
@@ -710,6 +711,16 @@ class Engine:
         for gi, plist in enumerate(group_presses):
             timelines[gi] = [PressTimeline(press=p) for p in plist]
 
+        # 模具时间轴按**模具号全局**建一条，而不是按组各建一条。§5.6 的假设是
+        # 「一副模具同一时刻只能装在一台热压机上」，模具号标识的正是那副物理模具，
+        # 所以它必须跨组串行。正常情况下每副模具只属于一个套、每组又绑定互不相同的套，
+        # 因此与按组建完全等价；只有当同一模具号出现在两个套里时，按组建才会让
+        # 同一副模具同时出现在两台机台上（C02 必失败）。
+        mold_tls: dict[str, MoldTimeline] = {}
+        for s in selected_sets:
+            for m in s.available_molds:
+                mold_tls.setdefault(m.mold_no, MoldTimeline(mold_no=m.mold_no))
+
         # 工单分配：按排序依次放入「预计完成时间最早」的组。
         # 组内并行度受套内模具副数限制（一副模具同一时刻只能装一台机），
         # 因此负荷需按有效并行度折算，否则模具少的组会占满工单却只开一台机。
@@ -772,9 +783,6 @@ class Engine:
             }
 
             plist = timelines[gi]
-            mold_tls = {
-                m.mold_no: MoldTimeline(mold_no=m.mold_no) for m in mold_set.available_molds
-            }
             placed_batches: list[Batch] = []
             for b in batch_list:
                 # §20.2：时间上限在批次粒度上生效。未落位的工单由 run() 统一报 R007。

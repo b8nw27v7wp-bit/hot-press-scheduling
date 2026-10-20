@@ -590,20 +590,32 @@ def main() -> int:
           f"={not (unplaced35 - rep35)}")
     results.append(case35_ok)
 
-    # 36. 模具号跨套重复（同一副物理模具出现在两个套里）：必须报输入异常，
-    #     不得静默产出「同一副模具同时装在两台机台」的物理不可能结果。
+    # 36. 模具号跨套重复（同一副物理模具出现在两个套里）：既要报出这个资料异常，
+    #     又不得产出「同一副模具同时装在两台机台」的物理不可能结果——§5.6 的假设是
+    #     一副模具同一时刻只在一台机上，因此必须跨组串行（C02 不得失败）。
     dup_sets = {
         "S1": MoldSet("S1", "P01", 1, [mold("MX", "S1", 1, {"X": 2}),
                                        mold("M1", "S1", 2, {"X": 2})]),
         "S2": MoldSet("S2", "P01", 2, [mold("MX", "S2", 1, {"X": 2}),
                                        mold("M2", "S2", 2, {"X": 2})]),
     }
-    r36 = build([WorkOrder("WD1", "SO1", "P01", "X", D(200), "张", date(2026, 2, 10))],
-                dup_sets, presses).run()
+    dup_orders = [WorkOrder(f"WD{i}", f"SD{i}", "P01", "X", D(200), "张", date(2026, 2, 10))
+                  for i in range(1, 5)]
+    dup_eng = build(dup_orders, dup_sets, two)
+    r36 = dup_eng.run()
     dup_exc = [e for e in r36.exceptions if e.code == "R010" and "MX" in e.detail]
-    case36_ok = bool(dup_exc) and "S1" in dup_exc[0].detail and "S2" in dup_exc[0].detail
-    print(f"[{'PASS' if case36_ok else 'FAIL'}] 跨套重复模具号报 R010"
-          f"（{'已报' if dup_exc else '未报'}）")
+    dup_errs = check_all(r36.assignments, r36.batches,
+                         {w.work_order_no: w for w in dup_orders}, two, r36.calendar,
+                         dup_sets, dup_eng.params,
+                         reported={e.work_order_no for e in r36.exceptions})
+    mx_ok = not any(e.startswith("C02") for e in dup_errs)
+    case36_ok = (
+        bool(dup_exc) and "S1" in dup_exc[0].detail and "S2" in dup_exc[0].detail
+        and mx_ok and not dup_errs and len(r36.assignments) == len(dup_orders)
+    )
+    print(f"[{'PASS' if case36_ok else 'FAIL'}] 跨套重复模具号：报 R010 且跨组串行不违反 C02"
+          f"（报 {'已' if dup_exc else '未'}异常，排程 {len(r36.assignments)}/{len(dup_orders)}，"
+          f"校验错误 {len(dup_errs)}）")
     results.append(case36_ok)
 
     # 37. V03 的另一半：交期早于计划起点时必须报 R010（且仍按最早可行时间排程）。
