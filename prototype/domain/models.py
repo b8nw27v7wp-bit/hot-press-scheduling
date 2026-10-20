@@ -1,0 +1,289 @@
+"""领域模型：热压排程算法的数据结构。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date
+from decimal import Decimal
+from enum import Enum
+from functools import cached_property
+
+
+class WorkOrderStatus(str, Enum):
+    NOT_STARTED = "NOT_STARTED"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+
+
+class MoldType(str, Enum):
+    SINGLE = "SINGLE"
+    MULTI = "MULTI"
+
+
+class ResourceStatus(str, Enum):
+    AVAILABLE = "AVAILABLE"
+    MAINTENANCE = "MAINTENANCE"
+
+
+# §14.0 原因码严重度：异常 > 瓶颈 > 预警 > 信息
+REASON_SEVERITY: dict[str, int] = {
+    "R008": 3, "R009": 3, "R010": 3, "R011": 3,
+    "R005": 2, "R006": 2, "R007": 2,
+    "R002": 1, "R012": 1,
+    "R001": 0, "R003": 0, "R004": 0,
+}
+
+
+def primary_reason(codes: list[str]) -> str:
+    """§4.1 取最严重者；同级时按码值升序，保证确定性。"""
+    if not codes:
+        return ""
+    return min(codes, key=lambda c: (-REASON_SEVERITY.get(c, 0), c))
+
+
+@dataclass(frozen=True)
+class ProductType:
+    code: str
+    name: str
+    erp_category_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MoldPattern:
+    mold_no: str
+    pattern_code: str
+    ratio: Decimal
+
+
+@dataclass
+class Mold:
+    mold_no: str
+    set_no: str
+    mold_type: MoldType
+    priority: int
+    ratios: dict[str, Decimal] = field(default_factory=dict)
+    status: ResourceStatus = ResourceStatus.AVAILABLE
+
+    def covers(self, pattern_code: str) -> bool:
+        return pattern_code in self.ratios
+
+    def covers_all(self, patterns) -> bool:
+        return all(p in self.ratios for p in patterns)
+
+    @property
+    def patterns(self) -> frozenset[str]:
+        return frozenset(self.ratios)
+
+    @property
+    def has_valid_ratios(self) -> bool:
+        """V07：配比缺失或非正的模具不可用（否则模数计算会除零或得出负模数）。"""
+        return bool(self.ratios) and all(r > 0 for r in self.ratios.values())
+
+
+@dataclass
+class MoldSet:
+    set_no: str
+    product_type_code: str
+    set_order: int
+    molds: list[Mold] = field(default_factory=list)
+
+    @cached_property
+    def available_molds(self) -> list[Mold]:
+        return sorted(
+            (
+                m
+                for m in self.molds
+                if m.status is ResourceStatus.AVAILABLE and m.has_valid_ratios
+            ),
+            key=lambda m: (m.priority, m.mold_no),
+        )
+
+    @property
+    def mold_count(self) -> int:
+        return len(self.available_molds)
+
+
+@dataclass(frozen=True)
+class Press:
+    press_no: str
+    capacity_per_shift: int
+    product_type_code: str
+    status: ResourceStatus = ResourceStatus.AVAILABLE
+
+
+@dataclass
+class WorkOrder:
+    work_order_no: str
+    sales_order_no: str
+    product_type_code: str
+    pattern_code: str
+    qty: Decimal
+    uom: str
+    # 允许缺失：需求第八章要求「交期缺失」标记为异常数据并报告，非空字段无法表示该情形
+    due_date: date | None = None
+    status: WorkOrderStatus = WorkOrderStatus.NOT_STARTED
+    remaining_qty: Decimal | None = None
+    material_code: str = ""
+
+    @property
+    def plan_qty(self) -> Decimal:
+        if self.status is WorkOrderStatus.IN_PROGRESS and self.remaining_qty is not None:
+            return self.remaining_qty
+        return self.qty
+
+    @property
+    def is_schedulable(self) -> bool:
+        return (
+            self.status not in (WorkOrderStatus.COMPLETED, WorkOrderStatus.CANCELLED)
+            and self.plan_qty > 0
+        )
+
+
+@dataclass(frozen=True)
+class CalendarDay:
+    day: date
+    shifts: int
+    is_holiday: bool = False
+
+    @property
+    def is_working(self) -> bool:
+        return self.shifts > 0 and not self.is_holiday
+
+
+@dataclass(frozen=True)
+class Params:
+    plan_start: date
+    group_size: int = 2
+    pre_offset_days: int = 15
+    shift_hours: int = 12
+    changeover_hours: int = 2
+    horizon_months: int = 3
+    # §20.2：全量计算的时间上限（秒）。0 表示不限制；超限则输出部分结果并置
+    # run_meta.truncated=true，同时把未排工单逐条报为异常。
+    time_limit_seconds: float = 0.0
+    allow_cross_sales_order_batch: bool = False
+    # §12.6：回填开关。true 时从「首个仍有剩余产能的槽位」起寻找连续空闲区间，
+    # 允许填入前面遗留的空档；false 时从追加游标起单调追加。
+    backfill_gaps: bool = True
+    set_activation_policy: str = "MAX_MOLDS_FIRST"
+
+
+@dataclass
+class Batch:
+    batch_no: str
+    sales_order_no: str
+    group_no: int
+    set_no: str
+    mold_no: str
+    press_no: str
+    work_order_nos: list[str] = field(default_factory=list)
+    patterns: set[str] = field(default_factory=set)
+    cycles: int = 0
+    cycles_by_mold: dict[str, int] = field(default_factory=dict)
+    start_slot: int = -1
+    end_slot: int = -1
+    changeover_cycles: int = 0
+    surplus: dict[str, Decimal] = field(default_factory=dict)
+    # 以下为 §4.2 要求的派生字段，追加在末尾以免打乱既有按位置构造的调用方
+    start_date: date | None = None
+    start_shift: int = 0
+    end_date: date | None = None
+    end_shift: int = 0
+    output_qty: dict[str, Decimal] = field(default_factory=dict)
+
+
+@dataclass
+class Assignment:
+    """单张工单的排程结果。"""
+
+    work_order_no: str
+    sales_order_no: str
+    product_type_code: str
+    pattern_code: str
+    batch_no: str
+    press_no: str
+    group_no: int
+    set_no: str
+    mold_no: str
+    plan_qty: Decimal
+    cycles: int
+    start_slot: int
+    end_slot: int
+    delayed: bool = False
+    delay_days: int = 0
+    reason_codes: list[str] = field(default_factory=list)
+    bottleneck_resource: str = ""
+    reason_text: str = ""
+    # 以下为 §4.1 要求的派生字段，追加在末尾以免打乱既有按位置构造的调用方
+    planned_start_date: date | None = None
+    planned_start_shift: int = 0
+    planned_end_date: date | None = None
+    planned_end_shift: int = 0
+
+    @property
+    def reason_code(self) -> str:
+        """§4.1 schedule_result.reason_code：完整列表中最严重的一个。"""
+        return primary_reason(self.reason_codes)
+
+
+@dataclass
+class ScheduleReason:
+    """§4.5 排程理由。"""
+
+    work_order_no: str
+    machine_reason: str = ""
+    time_reason: str = ""
+    batch_reason: str = ""
+    mold_reason: str = ""
+    sensitivity_note: str = ""
+
+
+@dataclass
+class ReleasePlan:
+    """§4.4 可释放数量与预计释放时间，供下游工序排程使用。"""
+
+    batch_no: str
+    pattern_code: str
+    release_qty: Decimal
+    release_date: date
+    release_shift: int
+    downstream_order_no: str = ""
+
+
+@dataclass
+class OrderDelivery:
+    """§4.3 订单齐套与延期。"""
+
+    sales_order_no: str
+    due_date: date
+    expected_finish_date: date
+    delayed: bool
+    delay_days: int
+    bottleneck_resource: str = ""
+    reason_code: str = ""
+    reason_text: str = ""
+
+
+@dataclass
+class TypeDiagnostics:
+    """单个产品类型的排程诊断，供 §13.3 瓶颈归因使用。"""
+
+    product_type_code: str
+    mold_set_count: int = 0
+    press_count: int = 0
+    max_groups: int = 0
+    groups_needed: int = 0
+    groups_used: int = 0
+    working_days: int = 0
+    latest_target: date | None = None
+    total_cycles: int = 0
+    daily_capacity: int = 0
+
+
+@dataclass
+class ExceptionRecord:
+    work_order_no: str
+    code: str
+    detail: str
+    suggestion: str = ""

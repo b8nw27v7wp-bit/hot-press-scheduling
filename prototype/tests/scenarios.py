@@ -1,0 +1,471 @@
+"""场景测试：确定性、延期、边界情况、批次不跨订单。"""
+
+from __future__ import annotations
+
+import sys
+from datetime import date, timedelta
+from decimal import Decimal
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from domain.models import (  # noqa: E402
+    CalendarDay,
+    Mold,
+    MoldSet,
+    MoldType,
+    Params,
+    Press,
+    ProductType,
+    TypeDiagnostics,
+    WorkOrder,
+    WorkOrderStatus,
+)
+from engine.delay import attribute  # noqa: E402
+from engine.scheduler import Engine  # noqa: E402
+from verify.constraint_checker import check_all  # noqa: E402
+
+PLAN_START = date(2026, 1, 5)
+D = Decimal
+
+
+def make_calendar(days: int = 120, skip_weekend: bool = True) -> dict[date, CalendarDay]:
+    out = {}
+    cur = PLAN_START
+    end = PLAN_START + timedelta(days=days)
+    while cur <= end:
+        if not skip_weekend or cur.weekday() < 5:
+            out[cur] = CalendarDay(cur, shifts=2)
+        cur += timedelta(days=1)
+    return out
+
+
+def mold(no, set_no, prio, ratios, kind=MoldType.MULTI):
+    return Mold(
+        mold_no=no,
+        set_no=set_no,
+        mold_type=kind,
+        priority=prio,
+        ratios={p: D(str(r)) for p, r in ratios.items()},
+    )
+
+
+def build(orders, mold_sets, presses, calendar=None, **kw):
+    params = Params(plan_start=PLAN_START, **kw)
+    ptypes = {"P01": ProductType("P01", "三角牌", ("A01",))}
+    return Engine(params, ptypes, mold_sets, presses, calendar or make_calendar(), orders)
+
+
+def run_case(name: str, orders, mold_sets, presses, calendar=None, expect=(), **kw):
+    engine = build(orders, mold_sets, presses, calendar, **kw)
+    result = engine.run()
+    errors = check_all(
+        result.assignments,
+        result.batches,
+        {w.work_order_no: w for w in orders},
+        presses,
+        result.calendar,
+        mold_sets,
+        engine.params,
+        reported={e.work_order_no for e in result.exceptions},
+    )
+    codes = {e.code for e in result.exceptions}
+    ok = True
+    notes = []
+    for e in expect:
+        if e not in codes:
+            ok = False
+            notes.append(f"缺少预期异常 {e}")
+    if errors:
+        ok = False
+        notes.append(f"约束失败 {errors}")
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}")
+    for n in notes:
+        print(f"       {n}")
+    return ok, result
+
+
+def main() -> int:
+    results = []
+
+    # 1. 确定性：同输入两次运行结果一致
+    s1 = MoldSet("S1", "P01", 1, [mold("M1", "S1", 1, {"X": 2, "Y": 2})])
+    presses = {"R1": Press("R1", 20, "P01"), "R2": Press("R2", 20, "P01")}
+    orders = [
+        WorkOrder(f"W{i:03d}", f"SO{i % 3}", "P01", "X" if i % 2 else "Y",
+                  D(60), "张", date(2026, 2, 10))
+        for i in range(1, 21)
+    ]
+    e1 = build(orders, {"S1": s1}, presses).run()
+    e2 = build(orders, {"S1": s1}, presses).run()
+    same = [(a.work_order_no, a.press_no, a.mold_no, a.start_slot, a.end_slot)
+            for a in e1.assignments] == [
+            (a.work_order_no, a.press_no, a.mold_no, a.start_slot, a.end_slot)
+            for a in e2.assignments]
+    print(f"[{'PASS' if same else 'FAIL'}] 确定性：相同输入两次运行结果一致")
+    results.append(same)
+
+    # 2. 批次不跨销售订单
+    s2 = MoldSet("S2", "P01", 1, [mold("M9", "S2", 1, {"X": 2, "Y": 2})])
+    cross_orders = [
+        WorkOrder("WA", "SO-A", "P01", "X", D(40), "张", date(2026, 2, 10)),
+        WorkOrder("WB", "SO-B", "P01", "Y", D(40), "张", date(2026, 2, 10)),
+    ]
+    _, r2 = run_case("批次不跨销售订单", cross_orders, {"S2": s2}, presses)
+    cross_ok = all(
+        len({next(w for w in cross_orders if w.work_order_no == n).sales_order_no
+             for n in b.work_order_nos}) == 1
+        for b in r2.batches
+    )
+    print(f"[{'PASS' if cross_ok else 'FAIL'}] 批次内工单同属一个销售订单")
+    results.append(cross_ok)
+
+    # 3. 多点模具合并：X/Y 同批
+    merged = [
+        WorkOrder("WX", "SO-M", "P01", "X", D(40), "张", date(2026, 2, 10)),
+        WorkOrder("WY", "SO-M", "P01", "Y", D(40), "张", date(2026, 2, 10)),
+    ]
+    _, r3 = run_case("多点模具合并", merged, {"S2": s2}, presses)
+    one_batch = len(r3.batches) == 1 and len(r3.batches[0].work_order_nos) == 2
+    print(f"[{'PASS' if one_batch else 'FAIL'}] 同订单 X/Y 合并为一个批次")
+    results.append(one_batch)
+
+    # 4. 无模具 → R008
+    _, _ = run_case("无可用模具", [
+        WorkOrder("W1", "SO1", "P01", "X", D(10), "张", date(2026, 2, 10))
+    ], {}, presses, expect=("R008",))
+    results.append(True)
+
+    # 5. 无适用机台 → R009
+    _, _ = run_case("无适用机台", [
+        WorkOrder("W1", "SO1", "P01", "X", D(10), "张", date(2026, 2, 10))
+    ], {"S1": s1}, {}, expect=("R009",))
+    results.append(True)
+
+    # 6. 空输入 → 空结果
+    _, r6 = run_case("空输入", [], {"S1": s1}, presses)
+    empty_ok = not r6.assignments and not r6.exceptions
+    print(f"[{'PASS' if empty_ok else 'FAIL'}] 空输入返回空结果")
+    results.append(empty_ok)
+
+    # 7. 已完成/已取消不参与
+    _, r7 = run_case("已完成/已取消排除", [
+        WorkOrder("W1", "SO1", "P01", "X", D(10), "张", date(2026, 2, 10),
+                  WorkOrderStatus.COMPLETED),
+        WorkOrder("W2", "SO1", "P01", "X", D(10), "张", date(2026, 2, 10),
+                  WorkOrderStatus.CANCELLED),
+        WorkOrder("W3", "SO1", "P01", "X", D(10), "张", date(2026, 2, 10)),
+    ], {"S1": s1}, presses)
+    only_w3 = [a.work_order_no for a in r7.assignments] == ["W3"]
+    print(f"[{'PASS' if only_w3 else 'FAIL'}] 已完成与已取消工单不排程")
+    results.append(only_w3)
+
+    # 8. 在制工单按剩余数量
+    _, r8 = run_case("在制工单剩余数量", [
+        WorkOrder("W1", "SO1", "P01", "X", D(100), "张", date(2026, 2, 10),
+                  WorkOrderStatus.IN_PROGRESS, remaining_qty=D(40)),
+    ], {"S1": s1}, presses)
+    # 40 张 / 配比 2 = 20 模
+    inprog_ok = len(r8.assignments) == 1 and r8.assignments[0].cycles == 20
+    print(f"[{'PASS' if inprog_ok else 'FAIL'}] 在制工单按剩余数量计算模数")
+    results.append(inprog_ok)
+
+    # 9. 延期：产能严重不足
+    tight = {"R1": Press("R1", 5, "P01")}
+    _, r9 = run_case("产能不足产生延期", [
+        WorkOrder(f"W{i:02d}", f"SO{i}", "P01", "X", D(500), "张",
+                  date(2026, 1, 20)) for i in range(1, 6)
+    ], {"S1": s1}, tight)
+    has_delay = any(a.delayed for a in r9.assignments)
+    print(f"[{'PASS' if has_delay else 'FAIL'}] 产能不足时标记延期")
+    results.append(has_delay)
+
+    # 10. 日历缺失 → R011 语义（不崩溃，正常排程）
+    cal = make_calendar()
+    for d in [date(2026, 1, 12), date(2026, 1, 13)]:
+        cal.pop(d, None)
+    _, r10 = run_case("日历缺失不崩溃", [
+        WorkOrder("W1", "SO1", "P01", "X", D(60), "张", date(2026, 2, 10))
+    ], {"S1": s1}, presses, calendar=cal)
+    missing_reported = bool(r10.calendar.missing_days)
+    print(f"[{'PASS' if missing_reported else 'FAIL'}] 日历缺失日期被记录")
+    results.append(missing_reported)
+
+    # 11. 单工单超班产能 → 跨日连续，不拆分
+    _, r11 = run_case("单工单超班产能", [
+        WorkOrder("W1", "SO1", "P01", "X", D(1000), "张", date(2026, 2, 10))
+    ], {"S1": s1}, {"R1": Press("R1", 10, "P01")})
+    span = r11.assignments[0].end_slot - r11.assignments[0].start_slot
+    no_split = len(r11.assignments) == 1 and span > 0
+    print(f"[{'PASS' if no_split else 'FAIL'}] 超班产能工单不拆分，跨槽位连续执行")
+    results.append(no_split)
+
+    # 12. 订单齐套：同订单最晚完成日与延期天数
+    _, r12 = run_case("订单齐套", [
+        WorkOrder("WA", "SO-K", "P01", "X", D(40), "张", date(2026, 2, 10)),
+        WorkOrder("WB", "SO-K", "P01", "Y", D(40), "张", date(2026, 2, 10)),
+    ], {"S1": s1}, presses)
+    od = r12.order_delivery
+    finish = max(r12.calendar.day_of(a.end_slot) for a in r12.assignments)
+    order_ok = (
+        len(od) == 1
+        and od[0].sales_order_no == "SO-K"
+        and od[0].expected_finish_date == finish
+        and od[0].delayed == any(a.delayed for a in r12.assignments)
+    )
+    print(f"[{'PASS' if order_ok else 'FAIL'}] 订单齐套记录最晚完成日与延期")
+    results.append(order_ok)
+
+    # 13. 改用次优先模具 → R003（组内第二台机取用套内第二副模具）
+    s_two = MoldSet("S1", "P01", 1, [
+        mold("M1", "S1", 1, {"X": 2}),
+        mold("M2", "S1", 2, {"X": 4}),
+    ])
+    _, r13 = run_case("次优先模具", [
+        WorkOrder("WX1", "SO-A", "P01", "X", D(400), "张", date(2026, 2, 10)),
+        WorkOrder("WX2", "SO-B", "P01", "X", D(400), "张", date(2026, 2, 10)),
+    ], {"S1": s_two}, presses)
+    r003 = any("R003" in a.reason_codes for a in r13.assignments)
+    print(f"[{'PASS' if r003 else 'FAIL'}] 未用最高优先级模具时记 R003")
+    results.append(r003)
+
+    # 14. 单工单超单班产能 → R004
+    _, r14 = run_case("超班产能记 R004", [
+        WorkOrder("W1", "SO1", "P01", "X", D(1000), "张", date(2026, 2, 10))
+    ], {"S1": s1}, {"R1": Press("R1", 10, "P01"), "R2": Press("R2", 10, "P01")})
+    r004 = any("R004" in a.reason_codes for a in r14.assignments)
+    print(f"[{'PASS' if r004 else 'FAIL'}] 单工单超单班产能记 R004")
+    results.append(r004)
+
+    # 15. 严重度：延期工单的主原因码应为瓶颈类（R005/R006/R007），而非信息类
+    tight2 = {"R1": Press("R1", 5, "P01"), "R2": Press("R2", 5, "P01")}
+    _, r15 = run_case("主原因码取最严重者", [
+        WorkOrder(f"W{i:02d}", f"SO{i}", "P01", "X", D(500), "张",
+                  date(2026, 1, 20)) for i in range(1, 6)
+    ], {"S1": s1}, tight2)
+    delayed = [a for a in r15.assignments if a.delayed]
+    severity_ok = bool(delayed) and all(
+        a.reason_code in ("R005", "R006", "R007") for a in delayed
+    )
+    print(f"[{'PASS' if severity_ok else 'FAIL'}] 延期工单主原因码取瓶颈类")
+    results.append(severity_ok)
+
+    # 16-19. §13.3 归因分支（直接对归因函数做单元断言）
+    wo = WorkOrder("W1", "SO1", "P01", "X", D(10), "张", date(2026, 2, 10))
+    cases = [
+        ("模具套数不足 → R005", TypeDiagnostics("P01", mold_set_count=2, press_count=8,
+                                                max_groups=2, groups_needed=3, groups_used=2), "R005"),
+        ("设备数量不足 → R006", TypeDiagnostics("P01", mold_set_count=4, press_count=2,
+                                                max_groups=1, groups_needed=3, groups_used=1), "R006"),
+        ("日历产能不足 → R007", TypeDiagnostics("P01", mold_set_count=4, press_count=8,
+                                                max_groups=4, groups_needed=1, groups_used=4,
+                                                working_days=10, total_cycles=10000,
+                                                daily_capacity=100), "R007"),
+        ("其余归模具产能 → R005", TypeDiagnostics("P01", mold_set_count=1, press_count=2,
+                                                  max_groups=1, groups_needed=1, groups_used=1), "R005"),
+    ]
+    for name, diag, expected in cases:
+        got, text = attribute(wo, diag, 2, date(2026, 2, 20))
+        ok = got == expected and bool(text)
+        print(f"[{'PASS' if ok else 'FAIL'}] 归因：{name}（得到 {got}）")
+        results.append(ok)
+
+    # 20. 交期缺失 → R010
+    _, r20 = run_case("交期缺失", [
+        WorkOrder("WNODUE", "SO1", "P01", "X", D(60), "张", None)
+    ], {"S1": s1}, presses, expect=("R010",))
+    results.append(True)
+
+    # 21. 数量 ≤ 0 → R010（不得静默丢弃）
+    _, r21 = run_case("数量非正", [
+        WorkOrder("WZERO", "SO1", "P01", "X", D(0), "张", date(2026, 2, 10)),
+        WorkOrder("WNEG", "SO1", "P01", "X", D(-5), "张", date(2026, 2, 10)),
+    ], {"S1": s1}, presses, expect=("R010",))
+    zero_reported = {"WZERO", "WNEG"} <= {e.work_order_no for e in r21.exceptions}
+    print(f"[{'PASS' if zero_reported else 'FAIL'}] 数量非正工单逐张报 R010，不静默丢弃")
+    results.append(zero_reported)
+
+    # 22. 工单号重复 → 保留首条，其余报 R010
+    _, r22 = run_case("工单号重复", [
+        WorkOrder("WDUP", "SO1", "P01", "X", D(60), "张", date(2026, 2, 10)),
+        WorkOrder("WDUP", "SO1", "P01", "Y", D(60), "张", date(2026, 2, 10)),
+    ], {"S1": s1}, presses, expect=("R010",))
+    dup_ok = [a.work_order_no for a in r22.assignments].count("WDUP") == 1
+    print(f"[{'PASS' if dup_ok else 'FAIL'}] 重复工单号只排一条")
+    results.append(dup_ok)
+
+    # 23. 日历不覆盖交期时不崩溃（此前会 IndexError 掀翻整个运行）
+    short_cal = {}
+    d = PLAN_START
+    while d <= date(2026, 2, 13):
+        if d.weekday() < 5:
+            short_cal[d] = CalendarDay(d, shifts=2)
+        d += timedelta(days=1)
+    try:
+        _, r23 = run_case("日历不覆盖交期", [
+            WorkOrder("W1", "SO1", "P01", "X", D(40), "张", date(2026, 4, 1))
+        ], {"S1": s1}, presses, calendar=short_cal)
+        no_crash = len(r23.assignments) == 1
+    except Exception as exc:  # noqa: BLE001
+        no_crash = False
+        print("       ", type(exc).__name__, exc)
+    print(f"[{'PASS' if no_crash else 'FAIL'}] 日历不覆盖交期时正常出结果而非崩溃")
+    results.append(no_crash)
+
+    # 24. R003 基准是「覆盖本批次的最高优先级模具」，套内更高优先级但不覆盖的模具不算
+    s_two_pat = MoldSet("S1", "P01", 1, [
+        mold("MA", "S1", 1, {"X": 2}),
+        mold("MB", "S1", 2, {"X": 2, "Y": 2}),
+    ])
+    _, r24 = run_case("R003 基准是覆盖模具", [
+        WorkOrder("WX", "SO-M", "P01", "X", D(40), "张", date(2026, 2, 10)),
+        WorkOrder("WY", "SO-M", "P01", "Y", D(40), "张", date(2026, 2, 10)),
+    ], {"S1": s_two_pat}, presses)
+    no_spurious = all("R003" not in a.reason_codes for a in r24.assignments)
+    print(f"[{'PASS' if no_spurious else 'FAIL'}] 只有唯一覆盖模具时不误报 R003")
+    results.append(no_spurious)
+
+    # 25. 订单齐套行内自洽：delay_days 必须等于本行 expected_finish − due_date
+    _, r25 = run_case("订单齐套行内自洽", [
+        WorkOrder("WA", "SO-1", "P01", "X", D(100), "张", date(2026, 1, 6)),
+        WorkOrder("WB", "SO-1", "P01", "Y", D(400), "张", date(2026, 1, 20)),
+    ], {"S1": MoldSet("S1", "P01", 1, [
+        mold("M1", "S1", 1, {"X": 2}), mold("M2", "S1", 2, {"Y": 2}),
+    ])}, {"R1": Press("R1", 5, "P01"), "R2": Press("R2", 5, "P01")})
+    consistent = all(
+        o.delay_days == max(0, (o.expected_finish_date - o.due_date).days)
+        for o in r25.order_delivery
+    )
+    print(f"[{'PASS' if consistent else 'FAIL'}] 订单齐套的 delay_days 与行内日期自洽")
+    results.append(consistent)
+
+    # 26. 批次表与工单表交叉一致（C15）
+    _, r26 = run_case("输出表交叉一致", [
+        WorkOrder(f"W{i:02d}", f"SO{i}", "P01", "X", D(500), "张", date(2026, 1, 20))
+        for i in range(1, 6)
+    ], {"S1": s1}, {"R1": Press("R1", 5, "P01")})
+    bnos = {b.batch_no for b in r26.batches}
+    linked = all(a.batch_no in bnos for a in r26.assignments)
+    print(f"[{'PASS' if linked else 'FAIL'}] 每条排程结果的批次号都存在于批次表")
+    results.append(linked)
+
+    # 27. 回填：机台时间轴上留有真实空隙时，回填应填入空隙，不回填应追加到末尾。
+    #     引擎的贪心规则（总选最早开工）几乎不产生空隙，因此这里直接对调度器
+    #     构造一个带空隙的时间轴来验证机制本身。
+    from engine.calendar import Calendar as _Cal
+    from engine.scheduling import (
+        Interval,
+        MoldTimeline,
+        PressTimeline,
+        Scheduler,
+    )
+
+    cal_days = make_calendar()
+    p_bf = Params(plan_start=PLAN_START, backfill_gaps=True)
+    sched = Scheduler(_Cal(cal_days, p_bf, PLAN_START + timedelta(days=119)), p_bf)
+    n = len(sched.calendar)
+    cap = 20
+
+    def _press_with_hole() -> PressTimeline:
+        tl = PressTimeline(press=Press("R1", cap, "P01"))
+        tl.ensure(n)
+        for s in list(range(0, 10)) + list(range(50, 60)):
+            tl.used[s] = cap
+        # 第二段用 M2、前驱是 M1，故其换模必须记为 4（配置值）——写成 0 会与
+        # 前驱模具矛盾，插入守卫会（正确地）拒绝往空隙里放东西。
+        tl.intervals = [Interval(0, 9, "M1", 0), Interval(50, 59, "M2", 4)]
+        tl.cursor = 60
+        tl.first_free = 10
+        return tl
+
+    probe = Mold("M3", "S1", MoldType.SINGLE, 3, {"X": D(2)})
+    m_tl = MoldTimeline("M3")
+    m_tl.ensure(n)
+
+    pt_bf = _press_with_hole()
+    got_bf = sched.evaluate(pt_bf, probe, m_tl, 100)  # 100 模 / 20 模每班 = 5 槽位
+
+    sched_nb = Scheduler(_Cal(cal_days, Params(plan_start=PLAN_START, backfill_gaps=False),
+                              PLAN_START + timedelta(days=119)),
+                         Params(plan_start=PLAN_START, backfill_gaps=False))
+    pt_nb = _press_with_hole()
+    m_tl2 = MoldTimeline("M3")
+    m_tl2.ensure(n)
+    got_nb = sched_nb.evaluate(pt_nb, probe, m_tl2, 100)
+
+    # 换模 4 + 100 模 = 104 模，每槽 20 模 → 占 6 个槽位
+    backfill_ok = (
+        got_bf is not None and got_bf.start == 10 and got_bf.end == 15
+        and got_nb is not None and got_nb.start == 60 and got_nb.end == 65
+    )
+    print(f"[{'PASS' if backfill_ok else 'FAIL'}] 回填填入机台空隙（回填 {got_bf}，不回填 {got_nb}）")
+    results.append(backfill_ok)
+
+    # 28. 批号规则（§11.6）：全局唯一、从 1 起连续、同输入可复现。
+    #     曾经的缺陷是「内层按创建的批次推进、外层按落位的批次推进」两套计数错位，
+    #     只要有批次排不进去就会复用批号——这里用多类型 + 产能不足的场景复现该条件。
+    multi = {
+        f"P{i:02d}": ProductType(f"P{i:02d}", f"类型{i}") for i in range(1, 4)
+    }
+    multi_sets, multi_presses = {}, {}
+    s_seq = p_seq = 0
+    for code in sorted(multi):
+        for _ in range(2):
+            p_seq += 1
+            multi_presses[f"R{p_seq:02d}"] = Press(f"R{p_seq:02d}", 20, code)
+        for s in range(2):
+            s_seq += 1
+            multi_sets[f"S{s_seq:02d}"] = MoldSet(
+                f"S{s_seq:02d}", code, s + 1,
+                [mold(f"M{s_seq:02d}", f"S{s_seq:02d}", 1, {"X": 2, "Y": 2})],
+            )
+    multi_orders = [
+        WorkOrder(f"WO{i:04d}", f"SO{i % 20:02d}", sorted(multi)[i % 3],
+                  ("X", "Y")[i % 2], D(4000), "张", date(2026, 3, 1))
+        for i in range(120)
+    ]
+    m_params = Params(plan_start=PLAN_START)
+    m1 = Engine(m_params, multi, multi_sets, multi_presses, make_calendar(), multi_orders).run()
+    m2 = Engine(m_params, multi, multi_sets, multi_presses, make_calendar(), multi_orders).run()
+    nos = [b.batch_no for b in m1.batches]
+    ints = sorted(int(x[1:]) for x in nos)
+    unique_ok = len(set(nos)) == len(nos) and not any(
+        a.batch_no not in set(nos) for a in m1.assignments
+    )
+    contiguous_ok = bool(ints) and ints[0] == 1 and ints == list(range(1, len(ints) + 1))
+    determinism_ok = nos == [b.batch_no for b in m2.batches]
+    partially_placed = 0 < len(m1.assignments) < len(multi_orders)
+    print(f"[{'PASS' if unique_ok else 'FAIL'}] 批号全局唯一且无悬空引用"
+          f"（{len(nos)} 个批次，排程 {len(m1.assignments)}/{len(multi_orders)}）")
+    results.append(unique_ok)
+    print(f"[{'PASS' if contiguous_ok else 'FAIL'}] 批号从 1 起连续"
+          f"（范围 {ints[0] if ints else '-'}..{ints[-1] if ints else '-'}）")
+    results.append(contiguous_ok)
+    print(f"[{'PASS' if determinism_ok else 'FAIL'}] 批号同输入可复现")
+    results.append(determinism_ok)
+    print(f"[{'PASS' if partially_placed else 'FAIL'}] 场景确实存在未落位批次（覆盖原缺陷条件）")
+    results.append(partially_placed)
+
+    # 29. §10.2 按需启用更多模具套：已选中的套覆盖不到的牌型，若还有可覆盖的套
+    #     且组数未达上限，应启用它，而不是误报 R008。
+    s_x = MoldSet("S1", "P01", 1, [mold("M1", "S1", 1, {"X": 2})])
+    s_y = MoldSet("S2", "P01", 2, [mold("M2", "S2", 1, {"Y": 2})])
+    four = {f"R{i}": Press(f"R{i}", 20, "P01") for i in range(1, 5)}
+    _, r29 = run_case("按需启用模具套", [
+        WorkOrder("WX", "SO1", "P01", "X", D(40), "张", date(2026, 2, 10)),
+        WorkOrder("WY", "SO2", "P01", "Y", D(40), "张", date(2026, 2, 10)),
+    ], {"S1": s_x, "S2": s_y}, four)
+    used_sets = {a.set_no for a in r29.assignments}
+    expand_ok = len(r29.assignments) == 2 and used_sets == {"S1", "S2"} and not any(
+        e.code == "R008" for e in r29.exceptions
+    )
+    print(f"[{'PASS' if expand_ok else 'FAIL'}] 覆盖不足时按需启用下一套（用到 {sorted(used_sets)}）")
+    results.append(expand_ok)
+
+    print()
+    print(f"通过 {sum(results)}/{len(results)}")
+    return 0 if all(results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

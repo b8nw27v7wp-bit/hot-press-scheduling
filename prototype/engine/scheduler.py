@@ -1,0 +1,787 @@
+"""主引擎：把各阶段串起来。"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from datetime import date, timedelta
+from decimal import Decimal
+from fractions import Fraction
+from time import perf_counter
+
+from domain.models import (
+    Assignment,
+    Batch,
+    CalendarDay,
+    ExceptionRecord,
+    Mold,
+    MoldSet,
+    OrderDelivery,
+    Params,
+    Press,
+    ProductType,
+    ReleasePlan,
+    ScheduleReason,
+    TypeDiagnostics,
+    WorkOrder,
+    WorkOrderStatus,
+)
+from engine import capacity, delay, explain, molding
+from engine.calendar import Calendar
+from engine.scheduling import MoldTimeline, PressTimeline, Scheduler
+
+ALGORITHM_VERSION = "0.1.0-prototype"
+
+# 排程地平线在「最晚交期」之后最多外推的天数，防止悲观估算溢出 date 范围
+MAX_HORIZON_DAYS = 3650
+
+
+@dataclass
+class RunResult:
+    assignments: list[Assignment]
+    batches: list[Batch]
+    order_delivery: list[OrderDelivery]
+    release_plan: list[ReleasePlan]
+    reasons: list[ScheduleReason]
+    exceptions: list[ExceptionRecord]
+    diagnostics: dict[str, TypeDiagnostics]
+    calendar: Calendar
+    meta: dict
+
+
+class Engine:
+    def __init__(
+        self,
+        params: Params,
+        product_types: dict[str, ProductType],
+        mold_sets: dict[str, MoldSet],
+        presses: dict[str, Press],
+        calendar_days: dict[date, CalendarDay],
+        work_orders: list[WorkOrder],
+    ):
+        self.params = params
+        self.product_types = product_types
+        self.mold_sets = mold_sets
+        self.presses = presses
+        self.work_orders = work_orders
+        self.calendar_days = calendar_days
+
+        self.horizon_end = self._compute_horizon()
+        self.calendar = Calendar(calendar_days, params, self.horizon_end)
+        self.exceptions: list[ExceptionRecord] = []
+        self._reasons: list[ScheduleReason] = []
+        # 批号唯一计数源。曾出现「内层按创建的批次推进、外层按落位的批次推进」
+        # 两套计数，一旦有批次排不进去，后面的类型就会复用已用过的批号。
+        self._batch_seq = 1
+
+    def _compute_horizon(self) -> date:
+        """日历必须覆盖到最晚可能完成日，否则延期工单会被误判为不可排。
+
+        取「最晚交期 + 前置偏移」与「按最悲观产能估算的总工作量」两者的较大值。
+        """
+        latest = max(
+            (w.due_date for w in self.work_orders if w.due_date), default=self.params.plan_start
+        )
+        base = latest + timedelta(days=self.params.pre_offset_days + 30)
+
+        total_cycles = 0
+        for w in self.work_orders:
+            if not w.is_schedulable:
+                continue
+            ratios = [
+                m.ratios[w.pattern_code]
+                for s in self.mold_sets.values()
+                if s.product_type_code == w.product_type_code
+                for m in s.available_molds
+                if m.covers(w.pattern_code)
+            ]
+            if ratios:
+                total_cycles += capacity.cycles_for(w.plan_qty, max(ratios))
+
+        caps = [
+            p.capacity_per_shift
+            for p in self.presses.values()
+            if p.status.name == "AVAILABLE"
+        ]
+        if total_cycles and caps:
+            # 最悲观：只有一台最慢机台、每天 1 班。
+            # 必须封顶：工作量极大时这个外推会溢出 date 范围（OverflowError），
+            # 而超过十年仍排不完的计划本身已经没有意义，按 R005/R007 报瓶颈即可。
+            pessimistic_days = min(total_cycles // max(1, min(caps)), MAX_HORIZON_DAYS)
+            return base + timedelta(days=pessimistic_days + 30)
+        return base
+
+    # ---------------- 主流程 ----------------
+
+    def run(self) -> RunResult:
+        t0 = perf_counter()
+        self._validate_resources()
+        valid = self._preprocess()
+
+        sets_by_type: dict[str, list[MoldSet]] = defaultdict(list)
+        for s in self.mold_sets.values():
+            sets_by_type[s.product_type_code].append(s)
+        for lst in sets_by_type.values():
+            lst.sort(key=lambda s: (s.set_order, s.set_no))
+
+        presses_by_type: dict[str, list[Press]] = defaultdict(list)
+        for p in self.presses.values():
+            if p.status.name == "AVAILABLE":
+                presses_by_type[p.product_type_code].append(p)
+        for lst in presses_by_type.values():
+            lst.sort(key=lambda p: p.press_no)
+
+        orders_by_type: dict[str, list[WorkOrder]] = defaultdict(list)
+        for w in valid:
+            orders_by_type[w.product_type_code].append(w)
+        for lst in orders_by_type.values():
+            lst.sort(key=lambda w: capacity.order_key(w, self.params))
+
+        assignments: list[Assignment] = []
+        batches: list[Batch] = []
+        diagnostics: dict[str, TypeDiagnostics] = {}
+        scheduled_types: set[str] = set()
+        truncated = False
+
+        for ptype in sorted(orders_by_type):
+            orders = orders_by_type[ptype]
+            sets = sets_by_type.get(ptype, [])
+            presses = presses_by_type.get(ptype, [])
+
+            if not sets:
+                for w in orders:
+                    self.exceptions.append(
+                        ExceptionRecord(w.work_order_no, "R008", f"产品类型 {ptype} 无可用模具")
+                    )
+                continue
+            if not presses:
+                for w in orders:
+                    self.exceptions.append(
+                        ExceptionRecord(w.work_order_no, "R009", f"产品类型 {ptype} 无适用机台")
+                    )
+                continue
+
+            max_groups = self._max_groups(sets, presses)
+            g_needed = self._estimate_groups(orders, sets[0], presses)
+
+            if self._time_exceeded(t0):
+                truncated = True
+                break
+
+            result = None
+            g_values = list(range(max(1, min(g_needed, max_groups)), max_groups + 1))
+            for idx, g in enumerate(g_values):
+                selected = self._select_sets(sets, g)
+                seq_before = self._batch_seq
+                result = self._schedule_type(
+                    ptype, orders, sets, presses, g, selected, g_needed, max_groups
+                )
+                # 只有「还会再试一次」时才回收编号；最后一次尝试的结果是要采纳的，
+                # 回收它的编号会让下一个产品类型撞号。
+                last_attempt = idx == len(g_values) - 1
+                if not any(a.delayed for a in result[0]) or last_attempt:
+                    break
+                self._batch_seq = seq_before
+            if result is None:
+                continue
+            type_assignments, type_batches, diag, type_exceptions, type_reasons = result
+            assignments.extend(type_assignments)
+            batches.extend(type_batches)
+            self.exceptions.extend(type_exceptions)
+            self._reasons.extend(type_reasons)
+            diagnostics[ptype] = diag
+            scheduled_types.add(ptype)
+
+        # 超时截断：未排的产品类型必须逐单报异常，不得静默丢弃（§20.2）
+        if truncated:
+            for ptype in sorted(orders_by_type):
+                if ptype in scheduled_types:
+                    continue
+                for w in orders_by_type[ptype]:
+                    self.exceptions.append(
+                        ExceptionRecord(
+                            w.work_order_no,
+                            "R007",
+                            "计算超出时间上限，该工单未排入（本次为部分结果）",
+                            "放宽时间上限或缩小计划范围后重算",
+                        )
+                    )
+
+        # 无有效工单即无可排计划，不报日历缺失（§15 8.8 空输入返回空结果）
+        latest_need = max(
+            (capacity.target_finish(w.due_date, self.params) for w in valid), default=None
+        )
+        for start, end in (self.calendar.missing_ranges(latest_need) if latest_need else []):
+            span = (end - start).days + 1
+            self.exceptions.append(
+                ExceptionRecord(
+                    "",
+                    "R011",
+                    f"{start} 至 {end} 日历缺失，按不生产处理，可用班次减少 {span} 天",
+                    "补录该区间班次后重算",
+                )
+            )
+
+        by_no = {w.work_order_no: w for w in valid}
+        delay.apply_attribution(
+            assignments, by_no, diagnostics, self.calendar, self.params.group_size
+        )
+        order_delivery = delay.build_order_delivery(assignments, by_no, self.calendar)
+        molds_by_no = {
+            m.mold_no: m for s in self.mold_sets.values() for m in s.molds
+        }
+        release_plan = explain.build_release_plan(
+            assignments, by_no, molds_by_no, self.calendar
+        )
+
+        from verify.constraint_checker import fingerprint  # 避免模块级循环依赖
+
+        elapsed = round(perf_counter() - t0, 3)
+
+        return RunResult(
+            assignments=assignments,
+            batches=batches,
+            order_delivery=order_delivery,
+            release_plan=release_plan,
+            reasons=self._reasons,
+            exceptions=self.exceptions,
+            diagnostics=diagnostics,
+            calendar=self.calendar,
+            meta={
+                "algorithm_version": ALGORITHM_VERSION,
+                "params": {
+                    k: (v.isoformat() if isinstance(v, date) else v)
+                    for k, v in asdict(self.params).items()
+                },
+                "horizon_end": self.horizon_end.isoformat(),
+                "input_counts": {
+                    "work_orders": len(self.work_orders),
+                    "schedulable": len(valid),
+                    "presses": len(self.presses),
+                    "mold_sets": len(self.mold_sets),
+                    "product_types": len(self.product_types),
+                    "calendar_days": len(self.calendar_days),
+                },
+                "result_hash": fingerprint(
+                    assignments, batches, order_delivery, release_plan
+                ),
+                "elapsed_seconds": elapsed,
+                "truncated": truncated,
+                "performance_note": self._performance_note(
+                    valid, assignments, elapsed, truncated
+                ),
+            },
+        )
+
+    def _performance_note(
+        self,
+        valid: list[WorkOrder],
+        assignments: list[Assignment],
+        elapsed: float,
+        truncated: bool,
+    ) -> str:
+        """§15 8.10 性能说明：规模显著超预期或超时截断时给出可读结论。"""
+        n_slots = len(self.calendar)
+        n_molds = sum(len(s.molds) for s in self.mold_sets.values())
+        head = (
+            f"输入规模：工单 {len(self.work_orders)} 张（有效 {len(valid)}）、"
+            f"产品类型 {len(self.product_types)} 个、机台 {len(self.presses)} 台、"
+            f"模具 {n_molds} 副、生产槽位 {n_slots} 个；计算用时 {elapsed}s。"
+        )
+        if truncated:
+            limit = self.params.time_limit_seconds
+            done = len({a.product_type_code for a in assignments})
+            return (
+                head
+                + f"已超过时间上限 {limit}s，本次只排完 {done} 个产品类型，"
+                f"其余工单未排入并已逐条报为异常（R007）。"
+                f"建议放宽时间上限、缩小计划范围或增加机台/模具后重算。"
+            )
+        return head + "未触发时间上限，本次为完整结果。"
+
+    def _expand_coverage(
+        self,
+        orders: list[WorkOrder],
+        sets: list[MoldSet],
+        presses: list[Press],
+        selected: list[MoldSet],
+        max_groups: int,
+    ) -> list[MoldSet]:
+        """§10.2：按需启用更多模具套，直到覆盖全部待排牌型或触到组数上限。
+
+        启用顺序沿用 §10.1 的策略排序；每新增一套都需要一组空闲机台。
+        """
+        needed = {w.pattern_code for w in orders}
+        chosen = list(selected)
+        chosen_nos = {s.set_no for s in chosen}
+        ordered_all = self._select_sets(sets, len(sets))
+
+        for cand in ordered_all:
+            if not needed - {p for s in chosen for m in s.available_molds for p in m.patterns}:
+                break
+            if cand.set_no in chosen_nos:
+                continue
+            if not ({p for m in cand.available_molds for p in m.patterns} & needed):
+                continue
+            # 新增一组需要 group_size 台空闲机台，且组数不得超过上限
+            if len(chosen) >= max_groups:
+                break
+            if (len(chosen) + 1) * self.params.group_size > len(presses):
+                break
+            chosen.append(cand)
+            chosen_nos.add(cand.set_no)
+        return chosen
+
+    def _diagnostics(
+        self,
+        ptype: str,
+        orders: list[WorkOrder],
+        sets: list[MoldSet],
+        presses: list[Press],
+        g_needed: int,
+        g_used: int,
+        selected: list[MoldSet],
+    ) -> TypeDiagnostics:
+        """汇总单个产品类型的诊断量，供 §13.3 归因与 §14 理由生成使用。"""
+        latest, days, slots = self._window_stats(orders)
+        cap = min((p.capacity_per_shift for p in presses), default=0)
+        parallel = sum(
+            max(1, min(self.params.group_size, s.mold_count)) for s in selected
+        ) or max(1, min(self.params.group_size, sets[0].mold_count))
+        return TypeDiagnostics(
+            product_type_code=ptype,
+            mold_set_count=len(sets),
+            press_count=len(presses),
+            max_groups=self._max_groups(sets, presses),
+            groups_needed=g_needed,
+            groups_used=g_used,
+            working_days=days,
+            latest_target=latest,
+            total_cycles=self._work_estimate(orders, sets[0].available_molds),
+            daily_capacity=(parallel * cap * slots) // days if days else 0,
+        )
+
+    # ---------------- P0 ----------------
+
+    def _time_exceeded(self, t0: float) -> bool:
+        limit = self.params.time_limit_seconds
+        return limit > 0 and (perf_counter() - t0) > limit
+
+    def _validate_resources(self) -> None:
+        """V06/V07/V09：机台、模具套、模具层面的输入校验。
+
+        这些对象不是「某张工单」的问题，而是资料本身有问题，因此异常记录的
+        工单号为空，靠 detail 指明具体对象。
+        """
+        # V06：机台的适用产品类型未定义 → 该机台不参与分配
+        for p in sorted(self.presses.values(), key=lambda x: x.press_no):
+            if p.product_type_code not in self.product_types:
+                self.exceptions.append(
+                    ExceptionRecord(
+                        "",
+                        "R009",
+                        f"机台 {p.press_no} 的适用产品类型 {p.product_type_code} 未定义，"
+                        f"该机台不参与分配",
+                        "补充产品类型映射或修正机台资料",
+                    )
+                )
+
+        for s in sorted(self.mold_sets.values(), key=lambda x: x.set_no):
+            # V09：模具套挂在一个未定义的产品类型上
+            if s.product_type_code not in self.product_types:
+                self.exceptions.append(
+                    ExceptionRecord(
+                        "",
+                        "R010",
+                        f"模具套 {s.set_no} 的产品类型 {s.product_type_code} 未定义，"
+                        f"该套模具不可用",
+                        "补充产品类型映射",
+                    )
+                )
+            for m in sorted(s.molds, key=lambda x: x.mold_no):
+                # V09：模具记录的所属套与它实际所在的套不一致
+                if m.set_no != s.set_no:
+                    self.exceptions.append(
+                        ExceptionRecord(
+                            "",
+                            "R010",
+                            f"模具 {m.mold_no} 记录的模具套 {m.set_no} 与所在套 {s.set_no} 不符",
+                            "核对模具资料",
+                        )
+                    )
+                # V07：配比缺失或非正
+                if not m.ratios:
+                    self.exceptions.append(
+                        ExceptionRecord(
+                            "",
+                            "R010",
+                            f"模具 {m.mold_no} 无产出配比，不可用",
+                            "补齐该模具的产出配比",
+                        )
+                    )
+                else:
+                    bad = sorted(p for p, r in m.ratios.items() if r <= 0)
+                    if bad:
+                        self.exceptions.append(
+                            ExceptionRecord(
+                                "",
+                                "R010",
+                                f"模具 {m.mold_no} 的配比非正：{'、'.join(bad)}，该模具不可用",
+                                "修正产出配比",
+                            )
+                        )
+
+    def _preprocess(self) -> list[WorkOrder]:
+        """P0 校验与预处理（§7）。
+
+        注意不能先用 is_schedulable 过滤：它要求 plan_qty > 0，会让「数量非正」
+        的工单在到达 R010 分支之前就被静默丢弃，违反需求第八章「必须报告，不得静默跳过」。
+        """
+        valid: list[WorkOrder] = []
+        seen: set[str] = set()
+        for w in self.work_orders:
+            if w.status in (WorkOrderStatus.COMPLETED, WorkOrderStatus.CANCELLED):
+                continue
+            if w.work_order_no in seen:
+                self.exceptions.append(
+                    ExceptionRecord(
+                        w.work_order_no, "R010", "工单号重复，保留首条，本条不排程", "核对工单来源"
+                    )
+                )
+                continue
+            seen.add(w.work_order_no)
+            if not w.pattern_code:
+                self.exceptions.append(
+                    ExceptionRecord(
+                        w.work_order_no, "R010", "牌型缺失，无法匹配模具", "补齐牌型后重算"
+                    )
+                )
+                continue
+            if w.due_date is None:
+                self.exceptions.append(
+                    ExceptionRecord(
+                        w.work_order_no, "R010", "交期缺失，不排程", "补齐客户交期后重算"
+                    )
+                )
+                continue
+            if w.plan_qty <= 0:
+                self.exceptions.append(
+                    ExceptionRecord(
+                        w.work_order_no,
+                        "R010",
+                        f"数量非正（排程数量 {w.plan_qty}），不排程",
+                        "核对工单数量或剩余数量",
+                    )
+                )
+                continue
+            if w.product_type_code not in self.product_types:
+                self.exceptions.append(
+                    ExceptionRecord(
+                        w.work_order_no,
+                        "R010",
+                        f"产品类型 {w.product_type_code} 未定义，无法映射到模具与机台",
+                        "补充产品类型映射",
+                    )
+                )
+                continue
+            valid.append(w)
+        return valid
+
+    # ---------------- P2 ----------------
+
+    def _max_groups(self, sets: list[MoldSet], presses: list[Press]) -> int:
+        """最多可同时开动的组数 = min(可用套数, 机台数 / 每组机台数)。"""
+        if not sets or not presses:
+            return 0
+        return max(1, min(len(sets), len(presses) // self.params.group_size))
+
+    def _work_estimate(self, orders: list[WorkOrder], molds: list[Mold]) -> int:
+        """§9.1 工作量下界：按销售订单分别取「单牌型总模数」的最大值再求和。
+
+        多点模具一次可同时推进多个牌型，机台模数的下界由单牌型总量的最大值决定。
+        """
+        per_order: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for w in orders:
+            best_ratio = max(
+                (m.ratios[w.pattern_code] for m in molds if m.covers(w.pattern_code)),
+                default=None,
+            )
+            if best_ratio is None:
+                continue
+            per_order[w.sales_order_no][w.pattern_code] += capacity.cycles_for(
+                w.plan_qty, best_ratio
+            )
+        return sum(max(v.values()) for v in per_order.values() if v)
+
+    def _window_stats(self, orders: list[WorkOrder]) -> tuple[date | None, int, int]:
+        """计划窗口统计：最晚目标完成日、窗口内生产日数、窗口内槽位数。
+
+        §9.3 的 H 是「plan_start 到该类型最晚 target_finish 的生产日数」，
+        不是整个推算地平线——后者会把需求组数压到 1，人为放大延期。
+
+        返回槽位数而非「平均每日班次」，是为了让下游全部用整数运算（§16.1
+        禁止浮点参与决策）。
+        """
+        latest = max(
+            (capacity.target_finish(w.due_date, self.params) for w in orders), default=None
+        )
+        window = [s for s in self.calendar.slots if latest is None or s.day <= latest]
+        return latest, len({s.day for s in window}), len(window)
+
+    def _estimate_groups(
+        self, orders: list[WorkOrder], mold_set: MoldSet, presses: list[Press]
+    ) -> int:
+        """§9.3 需求组数（未按 max_groups 截断）。
+
+        截断只发生在选取实际开动组数时；这里保留原始需求值，否则
+        「需求组数 > 上限」这一瓶颈永远无法被 §13.3 识别出来。
+        """
+        molds = mold_set.available_molds
+        if not molds:
+            return 1
+        work = self._work_estimate(orders, molds)
+
+        _, days, slots = self._window_stats(orders)
+        if days == 0 or slots == 0:
+            return 1
+        cap = min(p.capacity_per_shift for p in presses)
+        parallel = max(1, min(self.params.group_size, mold_set.mold_count))
+        # 一组在窗口内的总产能 = 组内并行度 × 机台班产能 × 窗口槽位数（全整数）
+        per_group = max(1, parallel * cap * slots)
+        return max(1, -(-work // per_group))
+
+    # ---------------- P3–P5 ----------------
+
+    def _select_sets(self, sets: list[MoldSet], g: int) -> list[MoldSet]:
+        """选定本次启用的模具套（§10.1）。
+
+        交期优先原则下，一组的两台机只有在该套有 ≥2 副模具时才能同时开工，
+        因此默认用 MAX_MOLDS_FIRST：先按「能填满组内并行度」排序，再按
+        set_order / set_no 稳定排序。否则会出现「有 3 副模具却只开 1 台机」的产能浪费。
+
+        策略名与其实际排序键严格对应，便于按 §18.1 A3 切换与追溯。
+        """
+        policy = self.params.set_activation_policy
+        if policy == "MAX_MOLDS_FIRST":
+            ordered = sorted(sets, key=lambda s: (-s.mold_count, s.set_order, s.set_no))
+        elif policy == "SET_ORDER":
+            ordered = sorted(sets, key=lambda s: (s.set_order, s.set_no))
+        elif policy == "COVERAGE_FIRST":
+            ordered = sorted(
+                sets,
+                key=lambda s: (-len({p for m in s.available_molds for p in m.patterns}),
+                               -s.mold_count, s.set_order, s.set_no),
+            )
+        else:
+            raise ValueError(
+                f"未知的模具套启用策略 {policy!r}，"
+                f"可选 MAX_MOLDS_FIRST / SET_ORDER / COVERAGE_FIRST"
+            )
+        return ordered[:g]
+
+    def _schedule_type(
+        self,
+        ptype: str,
+        orders: list[WorkOrder],
+        sets: list[MoldSet],
+        presses: list[Press],
+        g: int,
+        selected_sets: list[MoldSet],
+        g_needed: int,
+        max_groups: int,
+    ) -> tuple[
+        list[Assignment], list[Batch], TypeDiagnostics,
+        list[ExceptionRecord], list[ScheduleReason],
+    ]:
+        # 组数迭代会多次调用本方法，异常与理由只能由最终采纳的那一次提交
+        local_exceptions: list[ExceptionRecord] = []
+        scheduler = Scheduler(self.calendar, self.params)
+
+        # §10.2：已选中的套若覆盖不到某些牌型，而还有未启用且能覆盖的套、
+        # 且组数未达上限，则启用它。少了这一步，本可排产的工单会被误报 R008。
+        selected_sets = self._expand_coverage(
+            orders, sets, presses, selected_sets, max_groups
+        )
+
+        group_presses: list[list[Press]] = []
+        for i in range(len(selected_sets)):
+            chunk = presses[i * self.params.group_size : (i + 1) * self.params.group_size]
+            if chunk:
+                group_presses.append(chunk)
+        # 机台不足时组数按实际可组数收敛
+        g = len(group_presses)
+
+        timelines: dict[int, list[PressTimeline]] = {}
+        for gi, plist in enumerate(group_presses):
+            timelines[gi] = [PressTimeline(press=p) for p in plist]
+
+        # 工单分配：按排序依次放入「预计完成时间最早」的组。
+        # 组内并行度受套内模具副数限制（一副模具同一时刻只能装一台机），
+        # 因此负荷需按有效并行度折算，否则模具少的组会占满工单却只开一台机。
+        group_orders: dict[int, list[WorkOrder]] = defaultdict(list)
+        group_load: dict[int, int] = defaultdict(int)
+        group_parallel: dict[int, int] = {}
+        for gi in range(len(group_presses)):
+            mold_set = selected_sets[gi]
+            group_parallel[gi] = max(1, min(self.params.group_size, mold_set.mold_count))
+
+        for w in orders:
+            best_g = None
+            for gi in group_parallel:
+                mold_set = selected_sets[gi]
+                if not any(m.covers(w.pattern_code) for m in mold_set.available_molds):
+                    continue
+                ratio = max(
+                    (m.ratios[w.pattern_code] for m in mold_set.available_molds
+                     if m.covers(w.pattern_code)),
+                    default=1,
+                )
+                add = capacity.cycles_for(w.plan_qty, ratio)
+                # 折算后的负荷：用 Fraction 而非除法，避免浮点参与决策（§16.1）
+                projected = Fraction(group_load[gi] + add, group_parallel[gi])
+                key = (projected, gi)
+                if best_g is None or key < best_g[0]:
+                    best_g = (key, gi, add)
+            if best_g is None:
+                local_exceptions.append(
+                    ExceptionRecord(w.work_order_no, "R008", f"牌型 {w.pattern_code} 无模具覆盖")
+                )
+                continue
+            _, gi, add = best_g
+            group_orders[gi].append(w)
+            group_load[gi] += add
+
+        assignments: list[Assignment] = []
+        all_batches: list[Batch] = []
+        all_reasons: list[ScheduleReason] = []
+
+        diag = self._diagnostics(
+            ptype, orders, sets, presses, g_needed, len(group_presses), selected_sets
+        )
+
+        for gi, g_orders in sorted(group_orders.items()):
+            mold_set = selected_sets[gi]
+            # 这里的批号只是组内的临时序号（用于组内稳定排序）；
+            # 真正的全局批号在落位成功时分配，使未落位的批次不占用编号。
+            batch_list = molding.build_batches(
+                g_orders,
+                mold_set,
+                group_no=gi,
+                allow_cross_sales_order=self.params.allow_cross_sales_order_batch,
+                batch_seq_start=1,
+            )
+            by_no = {w.work_order_no: w for w in g_orders}
+            b_due = {
+                b.batch_no: min(by_no[n].due_date for n in b.work_order_nos)
+                for b in batch_list
+            }
+
+            plist = timelines[gi]
+            mold_tls = {
+                m.mold_no: MoldTimeline(mold_no=m.mold_no) for m in mold_set.available_molds
+            }
+            placed_batches: list[Batch] = []
+            for b in batch_list:
+                batch_due = b_due[b.batch_no]  # 必须在重新分配批号之前取出
+                batch_target_day = capacity.target_finish(batch_due, self.params)
+                target_slot = self.calendar.first_slot_on_or_after(batch_target_day)
+                decision = scheduler.place_batch(b, plist, mold_set.available_molds, mold_tls)
+                if decision is None:
+                    for no in b.work_order_nos:
+                        local_exceptions.append(
+                            ExceptionRecord(
+                                no,
+                                "R007",
+                                "排程超出日历范围（产能严重不足），该批次未排入",
+                                "延长日历或增加机台/模具后重算",
+                            )
+                        )
+                    continue
+                # 落位成功才分配全局批号：编号从 1 起连续，未落位的批次不占号（§11.6）
+                b.batch_no = f"B{self._batch_seq:05d}"
+                self._batch_seq += 1
+                press, mold, placement = decision.press, decision.mold, decision.placement
+                batch_cycles, switched = decision.cycles, decision.switched
+                slot_per_unit = scheduler.commit(
+                    press, mold_tls[mold.mold_no], placement, batch_cycles
+                )
+                b.mold_no = mold.mold_no
+                b.cycles = batch_cycles
+                b.press_no = press.press.press_no
+                b.start_slot = placement.start
+                b.end_slot = placement.end
+                b.changeover_cycles = placement.changeover
+                s_slot = self.calendar.slot(placement.start)
+                e_slot = self.calendar.slot(placement.end)
+                b.start_date, b.start_shift = s_slot.day, s_slot.shift
+                b.end_date, b.end_shift = e_slot.day, e_slot.shift
+                placed_batches.append(b)
+
+                for no in b.work_order_nos:
+                    wo = next(x for x in g_orders if x.work_order_no == no)
+                    cyc = capacity.cycles_for(wo.plan_qty, mold.ratios[wo.pattern_code])
+                    end = slot_per_unit[placement.changeover + cyc - 1]
+                    finish_day = self.calendar.day_of(end)
+                    d = capacity.delay_days(finish_day, wo.due_date)
+                    produced = Decimal(batch_cycles) * mold.ratios[wo.pattern_code]
+                    surplus = produced - wo.plan_qty
+                    # §4.2 按牌型记录产出与超产（每个牌型在批次内至多一张工单）
+                    b.output_qty[wo.pattern_code] = produced
+                    b.surplus[wo.pattern_code] = surplus
+                    own = self.calendar.slot(end)
+
+                    # R001/R002 判的是「是否落在前置窗口内」，与是否延期是两回事（§12.3）
+                    codes = ["R002"] if placement.end > target_slot else ["R001"]
+                    if switched:
+                        codes.append("R003")
+                    if cyc > press.press.capacity_per_shift:
+                        codes.append("R004")
+                    if surplus > 0:
+                        codes.append("R012")
+                    assignment = Assignment(
+                        work_order_no=no,
+                        sales_order_no=wo.sales_order_no,
+                        product_type_code=wo.product_type_code,
+                        pattern_code=wo.pattern_code,
+                        batch_no=b.batch_no,
+                        press_no=press.press.press_no,
+                        group_no=gi,
+                        set_no=mold_set.set_no,
+                        mold_no=mold.mold_no,
+                        plan_qty=wo.plan_qty,
+                        cycles=cyc,
+                        start_slot=placement.start,
+                        end_slot=end,
+                        planned_start_date=s_slot.day,
+                        planned_start_shift=s_slot.shift,
+                        planned_end_date=own.day,
+                        planned_end_shift=own.shift,
+                        delayed=d > 0,
+                        delay_days=d,
+                        reason_codes=codes,
+                    )
+                    assignments.append(assignment)
+                    all_reasons.append(
+                        explain.build_reason(
+                            assignment=assignment,
+                            wo=wo,
+                            batch=b,
+                            mold=mold,
+                            mold_set=mold_set,
+                            all_sets=sets,
+                            decision=decision,
+                            group_presses=group_presses[gi],
+                            calendar=self.calendar,
+                            params=self.params,
+                            target_day=batch_target_day,
+                            batch_due=batch_due,
+                            within_window=placement.end <= target_slot,
+                            finish_slot=end,
+                            batch_orders=[by_no[n] for n in b.work_order_nos],
+                            diag=diag,
+                        )
+                    )
+            # 未落位的批次不进 batch_result：它们没有起止时间，其工单已由 R007 异常报告
+            all_batches.extend(placed_batches)
+
+        return assignments, all_batches, diag, local_exceptions, all_reasons
