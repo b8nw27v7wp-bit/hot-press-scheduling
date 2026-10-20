@@ -122,7 +122,9 @@ def main() -> int:
     )
     check_elapsed = time.perf_counter() - t1
 
-    stats = summarize(result.assignments, result.batches, presses, result.calendar)
+    stats = summarize(
+        result.assignments, result.batches, presses, result.calendar, params, orders
+    )
     n_molds = sum(len(s.molds) for s in mold_sets.values())
     n_slots = len(result.calendar)
     delayed_orders = sum(1 for o in result.order_delivery if o.delayed)
@@ -134,8 +136,11 @@ def main() -> int:
     print(f"延期工单 {stats['delayed_work_orders']}（{stats['delayed_work_orders'] / len(orders):.1%}）"
           f"  总延期天数 {stats['total_delay_days']}")
     print(f"延期订单 {delayed_orders}（{delayed_orders / max(1, len(result.order_delivery)):.1%}）")
-    print(f"设备利用率 {stats['press_utilization']:.1%}  换模 {stats['changeover_count']} 次  "
-          f"超产 {stats['surplus_qty']}")
+    print(f"设备利用率 {stats['press_utilization']:.1%}（分母为整个计划地平线 {n_slots} 槽，"
+          f"由 §19 悲观外推，故偏低）")
+    print(f"交期窗口内利用率 {stats['window_utilization']:.1%}"
+          f"（分母为各类型交期窗口内的机台产能，判断产能是否富余看这个）")
+    print(f"换模 {stats['changeover_count']} 次  超产 {stats['surplus_qty']}")
     print(f"计算耗时 {elapsed:.2f}s  校验耗时 {check_elapsed:.2f}s")
     if errors:
         print(f"约束失败 {len(errors)} 项：")

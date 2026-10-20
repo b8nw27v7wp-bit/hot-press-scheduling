@@ -443,13 +443,68 @@ def check_determinism(first: str, second: str) -> list[str]:
 
 # ---------------- 统计 ----------------
 
+def _target_finish(due, params: Params):
+    """热压计划目标完成日 = 交期 − 前置偏移天数。按模块约定在此独立实现。"""
+    from datetime import timedelta
+
+    return max(due - timedelta(days=params.pre_offset_days), params.plan_start)
+
+
+def _window_utilization(
+    assignments: list[Assignment],
+    batches: list[Batch],
+    presses: dict[str, Press],
+    calendar: Calendar,
+    params: Params,
+    orders: list[WorkOrder],
+) -> float:
+    """交期窗口内的机台利用率。
+
+    分母只算「有工单排入的产品类型」在其交期窗口（plan_start 到该类型最晚
+    target_finish）内的机台产能，分子与 press_utilization 同口径。
+
+    与 press_utilization 的差别只在分母：后者用整个计划地平线，而地平线由 §19
+    按最悲观产能外推，远长于需求实际占用的区间，因此天然偏低。判断「产能是否真的
+    富余」要看本指标。
+    """
+    latest: dict[str, object] = {}
+    for w in orders:
+        if w.due_date is None:
+            continue
+        t = _target_finish(w.due_date, params)
+        if w.product_type_code not in latest or t > latest[w.product_type_code]:
+            latest[w.product_type_code] = t
+
+    scheduled_types = {a.product_type_code for a in assignments}
+    window_available = 0
+    for p in presses.values():
+        if p.status is not ResourceStatus.AVAILABLE:
+            continue
+        if p.product_type_code not in scheduled_types:
+            continue
+        until = latest.get(p.product_type_code)
+        if until is None:
+            continue
+        window_available += p.capacity_per_shift * sum(
+            1 for s in calendar.slots if s.day <= until
+        )
+    used = sum(b.cycles + b.changeover_cycles for b in batches)
+    return (used / window_available) if window_available else 0.0
+
+
 def summarize(
     assignments: list[Assignment],
     batches: list[Batch],
     presses: dict[str, Press],
     calendar: Calendar,
+    params: Params | None = None,
+    orders: list[WorkOrder] | None = None,
 ) -> dict:
-    """§17 要求的统计口径。订单级延期由 §4.3 order_delivery 单独给出。"""
+    """§17 要求的统计口径。订单级延期由 §4.3 order_delivery 单独给出。
+
+    press_utilization 的分母是整个计划地平线，见 _window_utilization 的说明；
+    传入 params 与 orders 时额外给出 window_utilization。
+    """
     n_slots = len(calendar)
     available = sum(
         p.capacity_per_shift * n_slots
@@ -459,7 +514,7 @@ def summarize(
     used = sum(b.cycles + b.changeover_cycles for b in batches)
     changeovers = sum(1 for b in batches if b.changeover_cycles > 0)
     surplus = sum((v for b in batches for v in b.surplus.values()), Decimal(0))
-    return {
+    stats = {
         "delayed_work_orders": sum(1 for a in assignments if a.delayed),
         "total_delay_days": sum(a.delay_days for a in assignments),
         "press_utilization": (used / available) if available else 0.0,
@@ -470,3 +525,8 @@ def summarize(
         "scheduled_work_orders": len(assignments),
         "batch_count": len(batches),
     }
+    if params is not None and orders is not None:
+        stats["window_utilization"] = _window_utilization(
+            assignments, batches, presses, calendar, params, orders
+        )
+    return stats
