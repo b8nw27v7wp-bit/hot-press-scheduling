@@ -166,7 +166,10 @@ class Params:
     # §12.6：回填开关。true 时从「首个仍有剩余产能的槽位」起寻找连续空闲区间，
     # 允许填入前面遗留的空档；false 时从追加游标起单调追加。
     backfill_gaps: bool = True
-    set_activation_policy: str = "MAX_MOLDS_FIRST"
+    # §10.1 模具套启用策略。默认按「用该套排完本类型待排工单所需机台模数」升序：
+    # 配比直接决定模数（模数 = ceil(数量/配比)），只看副数会选中副数多但配比差的套。
+    # 可选 MAX_MOLDS_FIRST / SET_ORDER / COVERAGE_FIRST。
+    set_activation_policy: str = "DEMAND_CYCLES_FIRST"
 
 
 @dataclass

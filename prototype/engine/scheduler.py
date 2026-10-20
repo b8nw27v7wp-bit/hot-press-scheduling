@@ -162,7 +162,10 @@ class Engine:
                 continue
 
             max_groups = self._max_groups(sets, presses)
-            g_needed = self._estimate_groups(orders, sets[0], presses)
+            # 启用顺序只依赖 (sets, orders)，与组数无关，故按类型算一次，
+            # 组数迭代里只做切片，避免重复评分。
+            ordered_sets = self._order_sets(sets, orders)
+            g_needed = self._estimate_groups(orders, ordered_sets[0], presses)
 
             if self._time_exceeded(t0):
                 truncated = True
@@ -171,10 +174,9 @@ class Engine:
             result = None
             g_values = list(range(max(1, min(g_needed, max_groups)), max_groups + 1))
             for idx, g in enumerate(g_values):
-                selected = self._select_sets(sets, g)
                 seq_before = self._batch_seq
                 result = self._schedule_type(
-                    ptype, orders, sets, presses, g, selected, g_needed, max_groups
+                    ptype, orders, sets, presses, g, ordered_sets, g_needed, max_groups
                 )
                 # 只有「还会再试一次」时才回收编号；最后一次尝试的结果是要采纳的，
                 # 回收它的编号会让下一个产品类型撞号。
@@ -302,19 +304,19 @@ class Engine:
     def _expand_coverage(
         self,
         orders: list[WorkOrder],
-        sets: list[MoldSet],
         presses: list[Press],
         selected: list[MoldSet],
+        ordered_all: list[MoldSet],
         max_groups: int,
     ) -> list[MoldSet]:
         """§10.2：按需启用更多模具套，直到覆盖全部待排牌型或触到组数上限。
 
-        启用顺序沿用 §10.1 的策略排序；每新增一套都需要一组空闲机台。
+        启用顺序沿用 §10.1 的策略排序，由调用方传入以保证与首次选套同源；
+        每新增一套都需要一组空闲机台。
         """
         needed = {w.pattern_code for w in orders}
         chosen = list(selected)
         chosen_nos = {s.set_no for s in chosen}
-        ordered_all = self._select_sets(sets, len(sets))
 
         for cand in ordered_all:
             if not needed - {p for s in chosen for m in s.available_molds for p in m.patterns}:
@@ -342,12 +344,14 @@ class Engine:
         g_used: int,
         selected: list[MoldSet],
     ) -> TypeDiagnostics:
-        """汇总单个产品类型的诊断量，供 §13.3 归因与 §14 理由生成使用。"""
+        """汇总单个产品类型的诊断量，供 §13.3 归因与 §14 理由生成使用。
+
+        统计口径必须落在**实际启用的套**上：这些量决定 R005/R006/R007 的归因，
+        取错资源会让「无法按期完成的原因」指向错误的瓶颈。
+        """
         latest, days, slots = self._window_stats(orders)
         cap = min((p.capacity_per_shift for p in presses), default=0)
-        parallel = sum(
-            max(1, min(self.params.group_size, s.mold_count)) for s in selected
-        ) or max(1, min(self.params.group_size, sets[0].mold_count))
+        parallel = sum(max(1, min(self.params.group_size, s.mold_count)) for s in selected)
         return TypeDiagnostics(
             product_type_code=ptype,
             mold_set_count=len(sets),
@@ -357,7 +361,10 @@ class Engine:
             groups_used=g_used,
             working_days=days,
             latest_target=latest,
-            total_cycles=self._work_estimate(orders, sets[0].available_molds),
+            # §9.1 的工作量下界取该类型全部套的模具：只取一套并不构成下界
+            total_cycles=self._work_estimate(
+                orders, [m for s in sets for m in s.available_molds]
+            ),
             daily_capacity=(parallel * cap * slots) // days if days else 0,
         )
 
@@ -552,32 +559,78 @@ class Engine:
 
     # ---------------- P3–P5 ----------------
 
-    def _select_sets(self, sets: list[MoldSet], g: int) -> list[MoldSet]:
-        """选定本次启用的模具套（§10.1）。
+    def _order_sets(self, sets: list[MoldSet], orders: list[WorkOrder]) -> list[MoldSet]:
+        """给出本类型全部套的启用顺序（§10.1）。
 
-        交期优先原则下，一组的两台机只有在该套有 ≥2 副模具时才能同时开工，
-        因此默认用 MAX_MOLDS_FIRST：先按「能填满组内并行度」排序，再按
-        set_order / set_no 稳定排序。否则会出现「有 3 副模具却只开 1 台机」的产能浪费。
+        返回完整顺序而非前 g 个：调用方按 `[:g]` 取用，同一顺序复用于 §10.2 的
+        按需补套，两处不会因各自重算而分叉。
 
         策略名与其实际排序键严格对应，便于按 §18.1 A3 切换与追溯。
         """
         policy = self.params.set_activation_policy
+        if policy == "DEMAND_CYCLES_FIRST":
+            scored = [(self._set_score(s, sets, orders), s) for s in sets]
+            scored.sort(
+                key=lambda x: (
+                    x[0] is None,
+                    x[0] if x[0] is not None else Fraction(0),
+                    -x[1].mold_count,
+                    x[1].set_order,
+                    x[1].set_no,
+                )
+            )
+            return [s for _, s in scored]
         if policy == "MAX_MOLDS_FIRST":
-            ordered = sorted(sets, key=lambda s: (-s.mold_count, s.set_order, s.set_no))
-        elif policy == "SET_ORDER":
-            ordered = sorted(sets, key=lambda s: (s.set_order, s.set_no))
-        elif policy == "COVERAGE_FIRST":
-            ordered = sorted(
+            return sorted(sets, key=lambda s: (-s.mold_count, s.set_order, s.set_no))
+        if policy == "SET_ORDER":
+            return sorted(sets, key=lambda s: (s.set_order, s.set_no))
+        if policy == "COVERAGE_FIRST":
+            return sorted(
                 sets,
                 key=lambda s: (-len({p for m in s.available_molds for p in m.patterns}),
                                -s.mold_count, s.set_order, s.set_no),
             )
-        else:
-            raise ValueError(
-                f"未知的模具套启用策略 {policy!r}，"
-                f"可选 MAX_MOLDS_FIRST / SET_ORDER / COVERAGE_FIRST"
-            )
-        return ordered[:g]
+        raise ValueError(
+            f"未知的模具套启用策略 {policy!r}，可选 DEMAND_CYCLES_FIRST / "
+            f"MAX_MOLDS_FIRST / SET_ORDER / COVERAGE_FIRST"
+        )
+
+    def _set_score(
+        self, s: MoldSet, all_sets: list[MoldSet], orders: list[WorkOrder]
+    ) -> Fraction | None:
+        """§10.1 DEMAND_CYCLES_FIRST：用该套排完本类型待排工单所需的机台模数，
+        除以有效并行度。越小越该优先启用；覆盖不到任何待排牌型的套返回 None。
+
+        两处口径必须如此，否则度量会有偏：
+
+        - 覆盖不到的工单记在「全类型最优配比」上，而不是跳过。若只累加本套能覆盖的
+          工单，覆盖面窄的套累加得少、得分反而低，度量会系统性偏袒窄覆盖的高配比套。
+        - 除以 min(组内机台数, 套内可用副数)：一副模具同一时刻只能装一台机，单副模具
+          的套实际只有 1 台机在跑，不折算会高估其产能（§5.6 有效并行度）。
+        """
+        best_here: dict[str, Decimal] = {}
+        for m in s.available_molds:
+            for p, r in m.ratios.items():
+                if r > best_here.get(p, Decimal(0)):
+                    best_here[p] = r
+        if not any(w.pattern_code in best_here for w in orders):
+            return None
+
+        best_anywhere: dict[str, Decimal] = {}
+        for other in all_sets:
+            for m in other.available_molds:
+                for p, r in m.ratios.items():
+                    if r > best_anywhere.get(p, Decimal(0)):
+                        best_anywhere[p] = r
+
+        total = 0
+        for w in orders:
+            ratio = best_here.get(w.pattern_code) or best_anywhere.get(w.pattern_code)
+            if ratio is None:
+                continue  # 全类型都无模具覆盖，该工单本就会走 R008
+            total += capacity.cycles_for(w.plan_qty, ratio)
+        # 走到这里说明 best_here 非空，即 s.mold_count >= 1，不会除零
+        return Fraction(total, min(self.params.group_size, s.mold_count))
 
     def _schedule_type(
         self,
@@ -586,7 +639,7 @@ class Engine:
         sets: list[MoldSet],
         presses: list[Press],
         g: int,
-        selected_sets: list[MoldSet],
+        ordered_sets: list[MoldSet],
         g_needed: int,
         max_groups: int,
     ) -> tuple[
@@ -597,10 +650,11 @@ class Engine:
         local_exceptions: list[ExceptionRecord] = []
         scheduler = Scheduler(self.calendar, self.params)
 
+        selected_sets = ordered_sets[:g]
         # §10.2：已选中的套若覆盖不到某些牌型，而还有未启用且能覆盖的套、
         # 且组数未达上限，则启用它。少了这一步，本可排产的工单会被误报 R008。
         selected_sets = self._expand_coverage(
-            orders, sets, presses, selected_sets, max_groups
+            orders, presses, selected_sets, ordered_sets, max_groups
         )
 
         group_presses: list[list[Press]] = []
