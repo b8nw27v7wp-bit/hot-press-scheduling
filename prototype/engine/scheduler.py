@@ -183,6 +183,17 @@ class Engine:
         batches: list[Batch] = []
         diagnostics: dict[str, TypeDiagnostics] = {}
 
+        # 模具时间轴按**模具号全局**建一条，跨产品类型共享。§5.6 的假设是「一副模具
+        # 同一时刻只能装在一台热压机上」，模具号标识的正是那副物理模具，所以它必须
+        # 跨类型串行：同一模具号可以出现在两个类型的套里（V10），按类型各建一条会让
+        # 两个类型同时占用它，C02 必失败。正常情况下每副模具只属于一个类型的套，
+        # 因此与按类型建完全等价。
+        mold_tls: dict[str, MoldTimeline] = {
+            m.mold_no: MoldTimeline(mold_no=m.mold_no)
+            for s in self.mold_sets.values()
+            for m in s.available_molds
+        }
+
         for ptype in sorted(orders_by_type):
             orders = orders_by_type[ptype]
             sets = sets_by_type.get(ptype, [])
@@ -215,8 +226,13 @@ class Engine:
             g_values = list(range(max(1, min(g_needed, max_groups)), max_groups + 1))
             for idx, g in enumerate(g_values):
                 seq_before = self._batch_seq
+                # 组数迭代会重跑本类型。模具时间轴是跨类型共享的，重跑前必须把本次
+                # 尝试占用的槽位还原，否则下一次尝试会看到并不存在的占用（进而不必要
+                # 地判为放不下）。机台时间轴是每次调用新建的，不需要还原。
+                mold_snapshot = {no: tl.busy[:] for no, tl in mold_tls.items()}
                 result = self._schedule_type(
-                    ptype, orders, sets, presses, g, ordered_sets, g_needed, max_groups
+                    ptype, orders, sets, presses, g, ordered_sets, g_needed, max_groups,
+                    mold_tls,
                 )
                 # 已超时：不再加组重试，采纳本次的部分结果
                 if self._truncated:
@@ -227,6 +243,8 @@ class Engine:
                 if not any(a.delayed for a in result[0]) or last_attempt:
                     break
                 self._batch_seq = seq_before
+                for no, busy in mold_snapshot.items():
+                    mold_tls[no].busy = busy
             if result is None:
                 continue
             type_assignments, type_batches, diag, type_exceptions, type_reasons = result
@@ -241,10 +259,16 @@ class Engine:
         # 那样已开排但没排完的类型里的剩余工单会被静默丢掉。
         if self._truncated:
             scheduled = {a.work_order_no for a in assignments}
-            already = {e.work_order_no for e in self.exceptions}
+            # 只跳过**已报过 R007** 的工单（批次落位失败时已逐条报过），不能按
+            # 「有任何异常」跳过：交期早于计划起点这类工单本身带一条 R010，若一并
+            # 跳过就永远拿不到「未排入」的结论，那条 R010 的文案（「已按最早可行
+            # 时间排程」）也会变成假的——它根本没被排程。
+            already_unscheduled = {
+                e.work_order_no for e in self.exceptions if e.code == "R007"
+            }
             for ptype in sorted(orders_by_type):
                 for w in orders_by_type[ptype]:
-                    if w.work_order_no in scheduled or w.work_order_no in already:
+                    if w.work_order_no in scheduled or w.work_order_no in already_unscheduled:
                         continue
                     self.exceptions.append(
                         ExceptionRecord(
@@ -741,6 +765,7 @@ class Engine:
         ordered_sets: list[MoldSet],
         g_needed: int,
         max_groups: int,
+        mold_tls: dict[str, MoldTimeline],
     ) -> tuple[
         list[Assignment], list[Batch], TypeDiagnostics,
         list[ExceptionRecord], list[ScheduleReason],
@@ -768,15 +793,8 @@ class Engine:
         for gi, plist in enumerate(group_presses):
             timelines[gi] = [PressTimeline(press=p) for p in plist]
 
-        # 模具时间轴按**模具号全局**建一条，而不是按组各建一条。§5.6 的假设是
-        # 「一副模具同一时刻只能装在一台热压机上」，模具号标识的正是那副物理模具，
-        # 所以它必须跨组串行。正常情况下每副模具只属于一个套、每组又绑定互不相同的套，
-        # 因此与按组建完全等价；只有当同一模具号出现在两个套里时，按组建才会让
-        # 同一副模具同时出现在两台机台上（C02 必失败）。
-        mold_tls: dict[str, MoldTimeline] = {}
-        for s in selected_sets:
-            for m in s.available_molds:
-                mold_tls.setdefault(m.mold_no, MoldTimeline(mold_no=m.mold_no))
+        # mold_tls 由 run() 按模具号全局建一条并跨产品类型共享（见那里的说明），
+        # 这里只使用，不再按本类型的 selected_sets 重建。
 
         # 工单分配：按排序依次放入「预计完成时间最早」的组。
         # 组内并行度受套内模具副数限制（一副模具同一时刻只能装一台机），

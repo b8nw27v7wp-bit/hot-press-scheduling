@@ -795,6 +795,57 @@ def main() -> int:
           f"保留优先级最高的一条（模数 {a47.cycles if a47 else None}）")
     results.append(case47_ok)
 
+    # 48. 同一模具号跨两个产品类型（V10）：模具时间轴必须**跨类型**串行。
+    #     此前 mold_tls 建在 _schedule_type 里，只在类型内串行，两个类型会各自
+    #     把同一副模具装在槽位 0，C02（一副模具同一时刻只在一台机台）必失败。
+    cross_sets = {
+        "S1": MoldSet("S1", "P01", 1, [mold("M1", "S1", 1, {"X": 2})]),
+        "S2": MoldSet("S2", "P02", 1, [mold("M1", "S2", 1, {"X": 2})]),
+    }
+    cross_types = {
+        "P01": ProductType("P01", "三角牌", ("A01",)),
+        "P02": ProductType("P02", "多米诺骨牌", ("A02",)),
+    }
+    cross_presses = {"R1": Press("R1", 20, "P01"), "R2": Press("R2", 20, "P02")}
+    cross_orders = [
+        WorkOrder("WC1", "SO1", "P01", "X", D(40), "张", date(2026, 2, 10)),
+        WorkOrder("WC2", "SO2", "P02", "X", D(40), "张", date(2026, 2, 10)),
+    ]
+    p48 = Params(plan_start=PLAN_START, group_size=2)
+    r48 = Engine(
+        p48, cross_types, cross_sets, cross_presses, make_calendar(), cross_orders
+    ).run()
+    errs48 = check_all(
+        r48.assignments, r48.batches, {w.work_order_no: w for w in cross_orders},
+        cross_presses, r48.calendar, cross_sets, p48,
+        reported={e.work_order_no for e in r48.exceptions},
+    )
+    case48_ok = len(r48.batches) == 2 and not errs48
+    print(f"[{'PASS' if case48_ok else 'FAIL'}] 跨产品类型共用模具号：模具跨类型串行，"
+          f"不违反 C02（批次数 {len(r48.batches)}，校验错误 {errs48}）")
+    results.append(case48_ok)
+
+    # 49. 截断时，带前置异常的工单也必须拿到「未排入」的结论。
+    #     此前按「有任何异常就跳过」过滤，交期早于计划起点的工单（自带一条 R010）
+    #     在截断时拿不到 R007，那条 R010 的「已按最早可行时间排程」于是成了假话。
+    early_orders = [
+        WorkOrder(f"WTR{i:03d}", f"SO{i % 3}", "P01", "X", D(60), "张",
+                  PLAN_START - timedelta(days=5))
+        for i in range(1, 201)
+    ]
+    r49 = build(early_orders, {"S1": s1}, presses, time_limit_seconds=0.001).run()
+    placed49 = {a.work_order_no for a in r49.assignments}
+    unplaced49 = [w for w in early_orders if w.work_order_no not in placed49]
+    r007 = {e.work_order_no for e in r49.exceptions if e.code == "R007"}
+    case49_ok = (
+        r49.meta["truncated"]
+        and bool(unplaced49)
+        and all(w.work_order_no in r007 for w in unplaced49)
+    )
+    print(f"[{'PASS' if case49_ok else 'FAIL'}] 截断：全部未排工单逐条报 R007"
+          f"（未排 {len(unplaced49)}，报 R007 {len(r007)}）")
+    results.append(case49_ok)
+
     print()
     print(f"通过 {sum(results)}/{len(results)}")
     return 0 if all(results) else 1
