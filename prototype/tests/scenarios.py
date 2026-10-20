@@ -633,6 +633,27 @@ def main() -> int:
           f"（{'已报' if early_reported else '未报'}，排程 {len(r37.assignments)} 张）")
     results.append(case37_ok)
 
+    # 38. 非法参数必须明确失败（§20.2「输入结构错误 → 非零退出码 + 错误明细，
+    #     不输出半成品结果」）。group_size / shift_hours 为 0 会 ZeroDivisionError，
+    #     为负数不崩却静默算出高估产能的排程——静默继续比明确失败更危险。
+    bad_params = [
+        ("group_size=0", {"group_size": 0}),
+        ("group_size=-1", {"group_size": -1}),
+        ("shift_hours=0", {"shift_hours": 0}),
+        ("pre_offset_days=-1", {"pre_offset_days": -1}),
+    ]
+    param_ok = True
+    for label, kw in bad_params:
+        try:
+            build([WorkOrder("WP", "SO1", "P01", "X", D(60), "张", date(2026, 2, 10))],
+                  {"S1": s1}, presses, **kw).run()
+        except ValueError:
+            continue
+        print(f"       非法参数未报错：{label}")
+        param_ok = False
+    print(f"[{'PASS' if param_ok else 'FAIL'}] 非法参数明确失败（{len(bad_params)} 项）")
+    results.append(param_ok)
+
     print()
     print(f"通过 {sum(results)}/{len(results)}")
     return 0 if all(results) else 1

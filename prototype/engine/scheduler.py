@@ -36,6 +36,30 @@ ALGORITHM_VERSION = "0.1.0-prototype"
 MAX_HORIZON_DAYS = 3650
 
 
+def validate_params(params: Params) -> None:
+    """§20.2「输入结构错误」：参数取值非法时立即失败，不输出半成品结果。
+
+    这些取值不会自然出现，但一旦出现，静默继续比明确失败更危险：
+    `group_size` 或 `shift_hours` 为 0 会在 `_max_groups` / `changeover_cycles`
+    里 ZeroDivisionError，为负数则不崩、却算出一份看似正常而实际高估产能的排程
+    （组宽为负会让分组切片错乱）；`changeover_hours` 取负值会被静默当成「不换模」，
+    `pre_offset_days` 取负值会让目标完成日落到交期之后——两者都是往乐观方向偏。
+    """
+    problems = []
+    if params.group_size < 1:
+        problems.append(f"group_size={params.group_size}（每组机台数须 ≥ 1）")
+    if params.shift_hours < 1:
+        problems.append(f"shift_hours={params.shift_hours}（单班时长须 ≥ 1 小时）")
+    if params.changeover_hours < 0:
+        problems.append(f"changeover_hours={params.changeover_hours}（换模时长不可为负）")
+    if params.pre_offset_days < 0:
+        problems.append(f"pre_offset_days={params.pre_offset_days}（前置偏移天数不可为负）")
+    if params.time_limit_seconds < 0:
+        problems.append(f"time_limit_seconds={params.time_limit_seconds}（时间上限不可为负）")
+    if problems:
+        raise ValueError("参数取值非法：" + "；".join(problems))
+
+
 @dataclass
 class RunResult:
     assignments: list[Assignment]
@@ -60,6 +84,7 @@ class Engine:
         work_orders: list[WorkOrder],
     ):
         self.params = params
+        validate_params(params)
         self.product_types = product_types
         self.mold_sets = mold_sets
         self.presses = presses
