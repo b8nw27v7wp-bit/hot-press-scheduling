@@ -133,8 +133,16 @@ def batch_reason(
     )
     surplus = batch.surplus.get(wo.pattern_code, Decimal(0))
     tail = f"本工单完成后该牌型超产 {surplus}。" if surplus > 0 else "本工单完成时该牌型无超产。"
+    # 开启 allow_cross_sales_order_batch 后批次可跨销售订单，此时「同属销售订单」
+    # 与事实相反，且同一批次的各工单会各自声称批次属于自己那个订单。
+    sales = sorted({w.sales_order_no for w in batch_orders})
+    same_order = (
+        f"同属销售订单 {wo.sales_order_no}"
+        if len(sales) == 1
+        else f"分属销售订单 {'、'.join(sales)}（已开启跨销售订单合批）"
+    )
     return (
-        f"与 {others} 同属销售订单 {wo.sales_order_no}，牌型互不冲突且可由同一副模具 "
+        f"与 {others} {same_order}，牌型互不冲突且可由同一副模具 "
         f"{mold.mold_no} 一次成型（{ratios}），故合并为批次 {batch.batch_no}。"
         f"批次按各工单模数最大值 {batch.cycles} 模运行，本工单 {wo.pattern_code} 于 "
         f"{_slot_text(calendar, finish_slot)} 完成。{tail}"
@@ -198,8 +206,12 @@ def sensitivity_note(
             f"需求 {diag.groups_needed} 组而当前上限 {diag.max_groups} 组"
             f"（{diag.mold_set_count} 套模具 / {diag.press_count} 台机台）"
         )
+    # 只陈述算式与当前取值。不能写「减少前置偏移就提前」——目标完成日 = 交期 -
+    # 前置偏移，减少它只会把目标完成日**推后**，且在早于计划起点时被钳到计划起点
+    # 而根本不变。方向性的因果一律交给末句的「重跑一次」。
     parts.append(
-        f"前置偏移每减少 1 天，目标完成日提前 1 天（当前 {params.pre_offset_days} 天）"
+        f"前置偏移当前 {params.pre_offset_days} 天，本工单目标完成日 "
+        f"{target_finish(wo.due_date, params)}（= 交期 - 前置偏移，早于计划起点时取计划起点）"
     )
     return "；".join(parts) + "。精确影响需以调整后的参数重跑一次。"
 
@@ -250,12 +262,21 @@ def build_release_plan(
     orders: dict[str, WorkOrder],
     molds: dict[str, Mold],
     calendar: Calendar,
+    batches: list[Batch] | None = None,
 ) -> list[ReleasePlan]:
     """§4.4 每批热压完成后可交付下游的数量与时间。
 
-    每个牌型的可释放量 = 该工单模数 × 该模具对该牌型的配比，完成时点取该工单自身
-    的完成槽位（批次仍在运行时，该牌型已可释放）。
+    口径取**批次**而非工单：多点模具每一模同时产出全部牌型，整批跑完
+    K(B) 模后该牌型的实际产出是 `K(B) × 配比`（§11.4 的 `produced(w)`），
+    完成时点即批次结束槽位。若改用该工单自身的 `K(w)`，同一份输出里
+    `schedule_result.output_qty`（记 K(B)×配比）与 `batch_result.surplus`
+    （报 K(B)×配比 - 需求量）会与释放量互相矛盾，超产部分等于凭空消失，
+    下游按释放计划排产就会少拿这一段物料。
+
+    传入 batches 时按批次口径；未传则回落到工单口径（保持旧行为，
+    仅用于不掌握批次表的调用方）。
     """
+    batch_index = {b.batch_no: b for b in (batches or [])}
     out: list[ReleasePlan] = []
     for a in sorted(assignments, key=lambda x: (x.batch_no, x.pattern_code, x.work_order_no)):
         wo = orders.get(a.work_order_no)
@@ -265,12 +286,14 @@ def build_release_plan(
         ratio = mold.ratios.get(a.pattern_code)
         if ratio is None:
             continue
-        slot = calendar.slot(a.end_slot)
+        b = batch_index.get(a.batch_no)
+        cycles = b.cycles if b is not None else a.cycles
+        slot = calendar.slot(b.end_slot if b is not None else a.end_slot)
         out.append(
             ReleasePlan(
                 batch_no=a.batch_no,
                 pattern_code=a.pattern_code,
-                release_qty=Decimal(a.cycles) * ratio,
+                release_qty=Decimal(cycles) * ratio,
                 release_date=slot.day,
                 release_shift=slot.shift,
             )

@@ -55,6 +55,9 @@ def build_order_delivery(
                 delay_days=delay,
                 bottleneck_resource=worst[1].bottleneck_resource,
                 reason_code=primary_reason([c for _, a in items for c in a.reason_codes]),
+                # §4.3 要求给出「原因说明」。取本订单延期最重的那张工单的归因文本，
+                # 与 bottleneck_resource 同源，否则该字段恒为空串。
+                reason_text=worst[1].reason_text,
             )
         )
     return out

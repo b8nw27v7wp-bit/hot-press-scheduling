@@ -245,7 +245,7 @@ class Engine:
             m.mold_no: m for s in self.mold_sets.values() for m in s.molds
         }
         release_plan = explain.build_release_plan(
-            assignments, by_no, molds_by_no, self.calendar
+            assignments, by_no, molds_by_no, self.calendar, batches
         )
 
         from verify.constraint_checker import fingerprint  # 避免模块级循环依赖
