@@ -28,8 +28,20 @@ PLAN_START = date(2026, 1, 5)
 SEED = 20260105
 
 
-def build(n_orders: int = 10000, n_types: int = 30, due_range: tuple[int, int] = (40, 110)):
-    rng = random.Random(SEED)  # 固定种子，保证可复现
+def build(
+    n_orders: int = 10000,
+    n_types: int = 30,
+    due_range: tuple[int, int] = (40, 110),
+    seed: int = SEED,
+    ratio_pool: tuple[int, ...] = (40, 60, 80, 120),
+    capacity_scale: float = 1.0,
+):
+    """默认参数即 §24 的规模测试数据集；其余参数供 tests/sensitivity.py 做扫描。
+
+    ratio_pool 控制同一类型内各套配比的离散度——§10.1 选套策略的收益依赖它。
+    capacity_scale 按比例缩放每班产能（取整，故各档之间不是严格等比）。
+    """
+    rng = random.Random(seed)  # 固定种子，保证可复现
 
     product_types = {
         f"P{i:02d}": ProductType(f"P{i:02d}", f"类型{i}", (f"A{i:02d}",))
@@ -54,7 +66,7 @@ def build(n_orders: int = 10000, n_types: int = 30, due_range: tuple[int, int] =
                         set_no=set_no,
                         mold_type=MoldType.MULTI if len(patterns) > 1 else MoldType.SINGLE,
                         priority=m + 1,
-                        ratios={p: Decimal(rng.choice([40, 60, 80, 120])) for p in patterns},
+                        ratios={p: Decimal(rng.choice(ratio_pool)) for p in patterns},
                     )
                 )
             mold_sets[set_no] = MoldSet(set_no, ptype, s + 1, molds)
@@ -65,7 +77,10 @@ def build(n_orders: int = 10000, n_types: int = 30, due_range: tuple[int, int] =
         ptype = f"P{i:02d}"
         for _ in range(rng.choice([2, 2, 4])):
             p_seq += 1
-            presses[f"R{p_seq:03d}"] = Press(f"R{p_seq:03d}", rng.choice([20, 24, 30]), ptype)
+            base_cap = rng.choice([20, 24, 30])
+            presses[f"R{p_seq:03d}"] = Press(
+                f"R{p_seq:03d}", max(1, int(base_cap * capacity_scale)), ptype
+            )
 
     calendar_days = {}
     cur = PLAN_START
