@@ -263,6 +263,12 @@ def main() -> int:
                                                 daily_capacity=100), "R007"),
         ("其余归模具产能 → R005", TypeDiagnostics("P01", mold_set_count=1, press_count=2,
                                                   max_groups=1, groups_needed=1, groups_used=1), "R005"),
+        # 机台数封顶且已开满、日历够用 → 瓶颈是设备而非模具。若用 §9.3 的 groups_needed
+        # 作判据（此处为 1，未超上限），会被误判为「受模具产能限制」的兜底 R005。
+        ("机台数封顶且已开满 → R006", TypeDiagnostics("P01", mold_set_count=4, press_count=2,
+                                                      max_groups=1, groups_needed=1, groups_used=1,
+                                                      working_days=83, total_cycles=3013,
+                                                      daily_capacity=80), "R006"),
     ]
     for name, diag, expected in cases:
         got, text = attribute(wo, diag, 2, date(2026, 2, 20))

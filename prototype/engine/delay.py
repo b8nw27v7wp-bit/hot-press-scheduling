@@ -68,24 +68,17 @@ def attribute(
 ) -> tuple[str, str]:
     """§13.3 瓶颈归因，取首个命中项。返回 (原因码, 具体原因文本)。
 
+    判定顺序为**日历 → 资源上限 → 兜底**。日历排在资源之前：生产日或班次不够不是
+    加机台、加模具能解决的，先报出来才有指向性；反之若日历够用而组数已开满，
+    那才是资源数量的问题。
+
+    资源分支以「已开满组数上限」为判据，**不用** §9.3 的 `groups_needed`：后者是为
+    §9.4 组数迭代算的下界估算（偏乐观），拿它当诊断判据会把「已开满、再加一组确实
+    能缓解」的延期误判成非资源原因。§9.4 只在上一组数仍有延期时才加组，因此走到
+    「开满且仍延期」即说明组数就是限制。
+
     禁止输出「产能不足」这类笼统描述，原因必须落到套数、机台数或日历上。
     """
-    sets_cap = diag.mold_set_count
-    press_cap = diag.press_count // group_size
-    saturated = diag.groups_used >= diag.max_groups > 0
-    short_of_groups = diag.groups_needed > diag.max_groups
-
-    if saturated and short_of_groups and diag.max_groups == sets_cap:
-        return "R005", (
-            f"产品类型 {wo.product_type_code} 仅有 {sets_cap} 套模具，最多开动 "
-            f"{diag.max_groups} 组，需求需 {diag.groups_needed} 组，模具套数不足"
-        )
-    if saturated and short_of_groups and diag.max_groups == press_cap:
-        return "R006", (
-            f"产品类型 {wo.product_type_code} 适用机台 {diag.press_count} 台，按每组 "
-            f"{group_size} 台最多开动 {diag.max_groups} 组，需求需 {diag.groups_needed} 组，"
-            f"设备数量不足"
-        )
     if diag.daily_capacity > 0 and diag.working_days > 0:
         needed_days = -(-diag.total_cycles // diag.daily_capacity)
         if needed_days > diag.working_days:
@@ -94,10 +87,25 @@ def attribute(
                 f"{diag.daily_capacity * diag.working_days} 模，需求 {diag.total_cycles} 模，"
                 f"日历生产日/班次不足"
             )
+
+    sets_cap = diag.mold_set_count
+    press_cap = diag.press_count // group_size
+    saturated = diag.groups_used >= diag.max_groups > 0
+
+    if saturated and diag.max_groups == sets_cap:
+        return "R005", (
+            f"产品类型 {wo.product_type_code} 仅配 {sets_cap} 套模具，最多开动 "
+            f"{diag.max_groups} 组且已开满，模具套数不足"
+        )
+    if saturated and diag.max_groups == press_cap:
+        return "R006", (
+            f"产品类型 {wo.product_type_code} 适用机台 {diag.press_count} 台，按每组 "
+            f"{group_size} 台最多开动 {diag.max_groups} 组且已开满，设备数量不足"
+        )
     return "R005", (
-        f"产品类型 {wo.product_type_code} 已开满 {diag.groups_used} 组（上限 "
-        f"{diag.max_groups} 组），工单 {wo.work_order_no} 于 {finish_day} 完成，"
-        f"晚于交期 {wo.due_date}，受模具产能限制"
+        f"产品类型 {wo.product_type_code} 已开动 {diag.groups_used} 组（上限 "
+        f"{diag.max_groups} 组）未开满，工单 {wo.work_order_no} 于 {finish_day} 完成，"
+        f"晚于交期 {wo.due_date}，受排程顺序限制"
     )
 
 
