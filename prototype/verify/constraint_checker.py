@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 from collections import defaultdict
 from decimal import Decimal, ROUND_CEILING
 
@@ -31,7 +30,15 @@ def _ceil_cycles(qty: Decimal, ratio: Decimal) -> int:
 
 
 def _configured_changeover(params: Params, capacity_per_shift: int) -> int:
-    return math.ceil(params.changeover_hours / params.shift_hours * capacity_per_shift)
+    """换模时长折算成模数，向上取整。
+
+    必须走整数运算（§16.1）：`ceil(h / shift * cap)` 的浮点中间值会偶发多出 1
+    ——例如 h=7、shift=12、cap=108 时 `7/12*108` 算出 63.000000000000007，
+    取整得 64，而按整数上取整应为 63。那会让完全合规的结果被 C08 判为无效。
+    """
+    if params.changeover_hours <= 0:
+        return 0
+    return -(-(params.changeover_hours * capacity_per_shift) // params.shift_hours)
 
 
 class _Context:
@@ -126,11 +133,19 @@ def _check_mold_serialization(ctx: _Context) -> list[str]:
 # ---------------- C03 ----------------
 
 def _check_within_calendar(ctx: _Context) -> list[str]:
+    """所有任务（工单级与批次级）都落在日历的槽位范围内。
+
+    两张表都要查：C01/C02/C06/C07/C08 只遍历 batches，本项若也只查 assignments，
+    批次表被写坏时（槽位为 -1 或越界）整份结果仍会被判为有效。
+    """
     errs = []
     n = len(ctx.calendar)
     for a in ctx.assignments:
         if a.start_slot < 0 or a.end_slot >= n or a.start_slot > a.end_slot:
             errs.append(f"C03 工单 {a.work_order_no} 越出日历范围 {a.start_slot}-{a.end_slot}")
+    for b in ctx.batches:
+        if b.start_slot < 0 or b.end_slot >= n or b.start_slot > b.end_slot:
+            errs.append(f"C03 批次 {b.batch_no} 越出日历范围 {b.start_slot}-{b.end_slot}")
     return errs
 
 
@@ -184,7 +199,13 @@ def _check_mold_belongs_to_type(ctx: _Context) -> list[str]:
 # ---------------- C06 ----------------
 
 def _check_set_single_group(ctx: _Context) -> list[str]:
-    """同一套模具同一时刻只能被一组使用。"""
+    """同一套模具同一时刻只能被一组使用。
+
+    必须比较**任意**跨组区间对，不能只比较排序后的相邻对：同一组的两条批次
+    若夹在中间，会把「组 A 的长区间」与「组 B 的区间」隔开，相邻比较看不到重叠。
+    按 start 排序后，只要区间 i 与更靠后的区间重叠就必然满足 `s2 <= e1`，
+    故内层在 `s2 > e1` 时即可终止。
+    """
     by_set = defaultdict(list)
     for b in ctx.batches:
         if b.start_slot < 0:
@@ -193,12 +214,15 @@ def _check_set_single_group(ctx: _Context) -> list[str]:
     errs = []
     for set_no, items in by_set.items():
         items.sort()
-        for (s1, e1, g1, b1), (s2, e2, g2, b2) in zip(items, items[1:]):
-            if g1 != g2 and s2 <= e1:
-                errs.append(
-                    f"C06 模具套 {set_no} 同时被组 {g1}（{b1}）与组 {g2}（{b2}）占用"
-                    f"：{s1}-{e1} 与 {s2}-{e2}"
-                )
+        for i, (s1, e1, g1, b1) in enumerate(items):
+            for s2, e2, g2, b2 in items[i + 1:]:
+                if s2 > e1:
+                    break
+                if g1 != g2:
+                    errs.append(
+                        f"C06 模具套 {set_no} 同时被组 {g1}（{b1}）与组 {g2}（{b2}）占用"
+                        f"：{s1}-{e1} 与 {s2}-{e2}"
+                    )
     return errs
 
 
@@ -370,6 +394,7 @@ def _check_tables_consistent(ctx: _Context) -> list[str]:
             errs.append(f"C15 批号 {no} 重复出现 {cnt} 次，批号必须全局唯一")
 
     batch_nos = {b.batch_no for b in ctx.batches}
+    batch_index = {b.batch_no: b for b in ctx.batches}
     scheduled: set[str] = set()
     assigned: dict[str, list[str]] = defaultdict(list)
     for a in ctx.assignments:
@@ -379,6 +404,8 @@ def _check_tables_consistent(ctx: _Context) -> list[str]:
             errs.append(
                 f"C15 工单 {a.work_order_no} 引用了不存在的批次 {a.batch_no}"
             )
+            continue
+        errs += _check_assignment_matches_batch(a, batch_index[a.batch_no])
     if ctx.assignments and not ctx.batches:
         errs.append(
             f"C15 有 {len(ctx.assignments)} 条排程结果但批次表为空，两张输出表不一致"
@@ -399,6 +426,29 @@ def _check_tables_consistent(ctx: _Context) -> list[str]:
     return errs
 
 
+def _check_assignment_matches_batch(a: Assignment, b: Batch) -> list[str]:
+    """排程结果与其所属批次必须在资源归属与时间区间上自洽。
+
+    工单区间是批次区间的子区间（同批次内各牌型的模数不同，完工槽位因此可以更早），
+    但所用机台/套/模具与所属组必须完全一致——否则「批次表」与「工单表」描述的是
+    两套互不相干的生产安排，而只查批次的 C01/C02/C06/C07/C08 看不出这一点。
+    """
+    errs = []
+    for field in ("press_no", "set_no", "mold_no", "group_no"):
+        av, bv = getattr(a, field), getattr(b, field)
+        if av != bv:
+            errs.append(
+                f"C15 工单 {a.work_order_no} 与批次 {b.batch_no} 的 {field} 不一致："
+                f"结果记录 {av}，批次记录 {bv}"
+            )
+    if not (b.start_slot <= a.start_slot and a.end_slot <= b.end_slot):
+        errs.append(
+            f"C15 工单 {a.work_order_no} 的区间 {a.start_slot}-{a.end_slot} "
+            f"不在批次 {b.batch_no} 的区间 {b.start_slot}-{b.end_slot} 内"
+        )
+    return errs
+
+
 # ---------------- C14 ----------------
 
 def fingerprint(
@@ -410,27 +460,37 @@ def fingerprint(
     """结果指纹，用于「相同输入两次运行输出一致」的复现校验（C14）。
 
     覆盖排程决策与由其派生的两张输出表；理由文本是前者的纯函数，不重复计入。
+
+    逐字段取全：这些量当前虽可由已计入的字段推出，但指纹是「相同输入输出一致」
+    的判据本身，漏掉任何输出字段都会让该项上的不确定性逃过检查。
+    取值一律排序后再拼，避免哈希遍历顺序引入不确定（§16.1）。
     """
     h = hashlib.sha256()
     for a in sorted(assignments, key=lambda x: x.work_order_no):
+        codes = ",".join(sorted(a.reason_codes))
         h.update(
-            f"{a.work_order_no}|{a.press_no}|{a.mold_no}|{a.batch_no}|"
-            f"{a.cycles}|{a.start_slot}|{a.end_slot}|{a.delay_days}\n".encode()
+            f"{a.work_order_no}|{a.sales_order_no}|{a.product_type_code}|{a.pattern_code}|"
+            f"{a.batch_no}|{a.press_no}|{a.set_no}|{a.mold_no}|{a.group_no}|"
+            f"{a.plan_qty}|{a.cycles}|{a.start_slot}|{a.end_slot}|"
+            f"{a.delayed}|{a.delay_days}|{codes}|{a.bottleneck_resource}\n".encode()
         )
     for b in sorted(batches, key=lambda x: x.batch_no):
+        surplus = ",".join(f"{p}={q}" for p, q in sorted(b.surplus.items()))
         h.update(
-            f"{b.batch_no}|{b.press_no}|{b.mold_no}|{b.start_slot}|{b.end_slot}|"
-            f"{b.cycles}|{','.join(sorted(b.work_order_nos))}\n".encode()
+            f"{b.batch_no}|{b.sales_order_no}|{b.group_no}|{b.set_no}|{b.mold_no}|"
+            f"{b.press_no}|{b.start_slot}|{b.end_slot}|{b.cycles}|{b.changeover_cycles}|"
+            f"{surplus}|{','.join(sorted(b.work_order_nos))}\n".encode()
         )
     for o in sorted(order_delivery or [], key=lambda x: x.sales_order_no):
         h.update(
             f"{o.sales_order_no}|{o.due_date}|{o.expected_finish_date}|"
-            f"{o.delay_days}|{o.reason_code}\n".encode()
+            f"{o.delayed}|{o.delay_days}|{o.bottleneck_resource}|"
+            f"{o.reason_code}\n".encode()
         )
     for r in sorted(release_plan or [], key=lambda x: (x.batch_no, x.pattern_code)):
         h.update(
             f"{r.batch_no}|{r.pattern_code}|{r.release_qty}|"
-            f"{r.release_date}|{r.release_shift}\n".encode()
+            f"{r.release_date}|{r.release_shift}|{r.downstream_order_no}\n".encode()
         )
     return h.hexdigest()
 
@@ -444,7 +504,7 @@ def check_determinism(first: str, second: str) -> list[str]:
 # ---------------- 统计 ----------------
 
 def _target_finish(due, params: Params):
-    """热压计划目标完成日 = 交期 − 前置偏移天数。按模块约定在此独立实现。"""
+    """热压计划目标完成日 = 交期 - 前置偏移天数。按模块约定在此独立实现。"""
     from datetime import timedelta
 
     return max(due - timedelta(days=params.pre_offset_days), params.plan_start)
