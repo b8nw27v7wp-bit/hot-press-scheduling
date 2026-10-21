@@ -17,13 +17,14 @@ from domain.models import (  # noqa: E402
     Params,
     Press,
     ProductType,
+    ResourceStatus,
     TypeDiagnostics,
     WorkOrder,
     WorkOrderStatus,
 )
 from engine.delay import attribute  # noqa: E402
 from engine.scheduler import Engine  # noqa: E402
-from verify.constraint_checker import check_all  # noqa: E402
+from verify.constraint_checker import check_all, fingerprint  # noqa: E402
 
 PLAN_START = date(2026, 1, 5)
 D = Decimal
@@ -40,13 +41,14 @@ def make_calendar(days: int = 120, skip_weekend: bool = True) -> dict[date, Cale
     return out
 
 
-def mold(no, set_no, prio, ratios, kind=MoldType.MULTI):
+def mold(no, set_no, prio, ratios, kind=MoldType.MULTI, status=ResourceStatus.AVAILABLE):
     return Mold(
         mold_no=no,
         set_no=set_no,
         mold_type=kind,
         priority=prio,
         ratios={p: D(str(r)) for p, r in ratios.items()},
+        status=status,
     )
 
 
@@ -845,6 +847,112 @@ def main() -> int:
     print(f"[{'PASS' if case49_ok else 'FAIL'}] 截断：全部未排工单逐条报 R007"
           f"（未排 {len(unplaced49)}，报 R007 {len(r007)}）")
     results.append(case49_ok)
+
+    # 50. 订单级延期完全来自「最早交期 / 最晚完成」的口径差、没有任何工单自身延期时，
+    #     reason_text 仍须给出说明。§4.3 要求这个字段是「具体原因」；它此前在整个
+    #     测试套件里零引用，所以恒为空串也没人发现。
+    _, r50 = run_case("订单级 min-due 延期", [
+        WorkOrder("WMA", "SO9", "P01", "X", D(200), "张", date(2026, 1, 20)),
+        WorkOrder("WMB", "SO9", "P01", "Y", D(40), "张", date(2026, 1, 6)),
+    ], {"S1": s1}, presses)
+    o50 = next((o for o in r50.order_delivery if o.delayed), None)
+    case50_ok = (
+        o50 is not None
+        and bool(o50.reason_text)
+        and all(w.delay_days == 0 for w in r50.assignments)  # 确无工单自身延期
+    )
+    print(f"[{'PASS' if case50_ok else 'FAIL'}] 订单级延期必有原因说明"
+          f"（{o50.delay_days if o50 else '-'} 天，"
+          f"reason_text={o50.reason_text[:36] if o50 else ''}…）")
+    results.append(case50_ok)
+
+    # 51. SET_ORDER 不得把「无可用模具的套」排在首位：它一旦被选中就占掉一个组名额，
+    #     却覆盖不到任何牌型，整个类型会落 R008，即便后面的套完全够用。
+    maint_set = MoldSet("S1", "P01", 1, [
+        mold("M1", "S1", 1, {"X": 2}, status=ResourceStatus.MAINTENANCE)
+    ])
+    usable_set = MoldSet("S2", "P01", 2, [mold("M2", "S2", 1, {"X": 2})])
+    _, r51 = run_case("SET_ORDER 跳过不可用套", [
+        WorkOrder("WSET", "SO1", "P01", "X", D(60), "张", date(2026, 2, 10))
+    ], {"S1": maint_set, "S2": usable_set}, presses, set_activation_policy="SET_ORDER")
+    case51_ok = len(r51.assignments) == 1 and not [
+        e for e in r51.exceptions if e.code == "R008"
+    ]
+    print(f"[{'PASS' if case51_ok else 'FAIL'}] SET_ORDER 跳过无可用模具的套"
+          f"（排程 {len(r51.assignments)}，R008 {len([e for e in r51.exceptions if e.code == 'R008'])}）")
+    results.append(case51_ok)
+
+    # 52. 有效并行度必须看组内**实际**机台数。组按 group_size 顺序切分机台，1 台机配
+    #     group_size=2 时该组只有 1 台机；用配置值会把产能算成两倍，并把「机台不够」
+    #     误归到模具套数上，R007 文案里的可完成模数也会翻倍。
+    two_molds = MoldSet("S1", "P01", 1, [
+        mold("M1", "S1", 1, {"X": 2}), mold("M2", "S1", 2, {"X": 2}),
+    ])
+    r52 = build(
+        [WorkOrder(f"WQ{i}", f"SO{i}", "P01", "X", D(2000), "张", date(2026, 2, 1))
+         for i in range(6)],
+        {"S1": two_molds}, {"R1": Press("R1", 20, "P01")},
+    ).run()
+    d52 = r52.diagnostics["P01"]
+    case52_ok = d52.daily_capacity == 40  # 1 台机 × 20 模/班 × 2 班
+    print(f"[{'PASS' if case52_ok else 'FAIL'}] 1 台机 + group_size=2 的日产能为 40"
+          f"（实际 {d52.daily_capacity}）")
+    results.append(case52_ok)
+
+    # 53. 校验器不传 reported 时，不得把引擎**正确跳过**的工单算成漏排：C10 的判据必须
+    #     与引擎 P0 预处理同口径（缺交期/缺牌型/数量非正/类型未定义）。
+    orders53 = [
+        WorkOrder("WOK53", "SO1", "P01", "X", D(60), "张", date(2026, 2, 10)),
+        WorkOrder("WNODUE53", "SO1", "P01", "X", D(60), "张", None),
+    ]
+    p53 = Params(plan_start=PLAN_START, group_size=2)
+    sets53 = {"S1": s1}
+    r53 = Engine(
+        p53, {"P01": ProductType("P01", "三角牌", ("A01",))}, sets53, presses,
+        make_calendar(), orders53,
+    ).run()
+    errs53 = check_all(  # 刻意不传 reported
+        r53.assignments, r53.batches, {w.work_order_no: w for w in orders53},
+        presses, r53.calendar, sets53, p53,
+    )
+    case53_ok = not errs53
+    print(f"[{'PASS' if case53_ok else 'FAIL'}] 不传 reported 时 C10 不误判被跳过的工单"
+          f"（{errs53}）")
+    results.append(case53_ok)
+
+    # 54. 同一个 Engine 重复 run() 必须得到同一结果：批号从 B00001 起、异常不叠加。
+    e54 = build(
+        [WorkOrder("WRP", "SO1", "P01", "X", D(60), "张", date(2026, 2, 10))],
+        {"S1": s1}, presses,
+    )
+    a54, b54 = e54.run(), e54.run()
+    case54_ok = (
+        [x.batch_no for x in a54.batches] == ["B00001"]
+        and [x.batch_no for x in b54.batches] == ["B00001"]
+        and len(a54.exceptions) == len(b54.exceptions)
+        and fingerprint(a54.assignments, a54.batches, a54.order_delivery, a54.release_plan)
+        == fingerprint(b54.assignments, b54.batches, b54.order_delivery, b54.release_plan)
+    )
+    print(f"[{'PASS' if case54_ok else 'FAIL'}] 重复 run() 结果幂等"
+          f"（批号 {[x.batch_no for x in a54.batches]} / {[x.batch_no for x in b54.batches]}，"
+          f"异常 {len(a54.exceptions)} / {len(b54.exceptions)}）")
+    results.append(case54_ok)
+
+    # 55. 窗口内一个生产日都没有时，归因必须是 R007（日历），不能落到资源分支去报
+    #     「模具套数不足」——加模具对零生产日毫无帮助。
+    dead_cal: dict = {}
+    cur55 = PLAN_START
+    while cur55 <= PLAN_START + timedelta(days=200):
+        dead_cal[cur55] = CalendarDay(cur55, 0 if cur55 <= date(2026, 2, 1) else 2)
+        cur55 += timedelta(days=1)
+    r55 = build(
+        [WorkOrder("WDEAD", "SO1", "P01", "X", D(4000), "张", date(2026, 1, 20))],
+        {"S1": s1}, {"R1": Press("R1", 20, "P01")}, calendar=dead_cal,
+    ).run()
+    case55_ok = bool(r55.assignments) and r55.assignments[0].reason_code == "R007"
+    print(f"[{'PASS' if case55_ok else 'FAIL'}] 窗口内零生产日归因 R007"
+          f"（{r55.assignments[0].reason_code if r55.assignments else '-'}）")
+    results.append(case55_ok)
 
     print()
     print(f"通过 {sum(results)}/{len(results)}")

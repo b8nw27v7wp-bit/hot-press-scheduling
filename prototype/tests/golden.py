@@ -290,6 +290,16 @@ def main() -> int:
     )
     checks.append(("每张工单都有完整四段排程理由（§4.5）", complete, ""))
 
+    # 9b. 订单既已判定延期，就必须给出原因说明（§4.3）。订单级的 due/finish 取
+    #     「最早交期 / 最晚完成」，与任何一张工单自身的延期都未必同源，所以这张表
+    #     的 reason_text 是独立推导出来的，不能按工单级理由顺带保证。
+    no_text = [o.sales_order_no for o in result.order_delivery if o.delayed and not o.reason_text]
+    checks.append((
+        "延期订单都有原因说明（§4.3）",
+        not no_text,
+        f"{len(no_text)} 条为空" + (f"，例 {no_text[0]}" if no_text else ""),
+    ))
+
     # 10. 可释放数量与工单一一对应
     checks.append((
         "可释放数量每条排程恰好一行（§4.4）",

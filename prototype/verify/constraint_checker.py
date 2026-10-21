@@ -20,6 +20,7 @@ from domain.models import (
     ResourceStatus,
     WorkOrder,
     WorkOrderStatus,
+    is_preprocessable,
 )
 from engine.calendar import Calendar
 
@@ -53,6 +54,7 @@ class _Context:
         calendar: Calendar,
         mold_sets: dict[str, MoldSet],
         params: Params,
+        product_types: dict | None = None,
     ):
         self.assignments = assignments
         self.batches = batches
@@ -61,6 +63,9 @@ class _Context:
         self.calendar = calendar
         self.mold_sets = mold_sets
         self.params = params
+        # C10 判「哪些工单应当出现在结果里」时要知道哪些产品类型是已定义的；
+        # 未传入时只能按工单自身的字段判断（见 is_preprocessable）。
+        self.product_type_codes = set(product_types) if product_types else None
         # 模具的身份是 (套, 模具号)，不是模具号：同一模具号可以出现在两个套里
         # （引擎按 §5.6 把它跨组串行）。若只按模具号建索引，后写的套会覆盖先写的，
         # 于是排在某套里的模具会被判成「不属于该套」而误报 C05。
@@ -91,9 +96,17 @@ def check_all(
     mold_sets: dict[str, MoldSet],
     params: Params,
     reported: set[str] | None = None,
+    product_types: dict | None = None,
 ) -> list[str]:
-    """reported 为已明确报异常的工单号，不计入「漏排」。"""
-    ctx = _Context(assignments, batches, orders, presses, calendar, mold_sets, params)
+    """reported 为已明确报异常的工单号，不计入「漏排」。
+
+    product_types 为已定义的产品类型表；C10 判「哪些工单应当排入」要用它，
+    不传则 C10 只能按工单自身字段判断（缺交期/缺牌型/数量非正仍会被排除，
+    但「产品类型未定义」这一类识别不了）。
+    """
+    ctx = _Context(
+        assignments, batches, orders, presses, calendar, mold_sets, params, product_types
+    )
     errors: list[str] = []
     errors += _check_press_no_overlap(ctx)          # C01
     errors += _check_mold_serialization(ctx)        # C02
@@ -326,7 +339,9 @@ def _check_no_split(ctx: _Context, reported: set[str]) -> list[str]:
         seen[a.work_order_no] += 1
     errs = [f"C09 工单 {no} 被拆分为 {c} 条记录" for no, c in seen.items() if c > 1]
     scheduled = set(seen)
-    expected = {no for no, w in ctx.orders.items() if w.is_schedulable}
+    expected = {
+        no for no, w in ctx.orders.items() if is_preprocessable(w, ctx.product_type_codes)
+    }
     for no in sorted(expected - scheduled - reported):
         errs.append(f"C10 有效工单 {no} 未出现在结果中")
     for no in sorted(scheduled - expected):
@@ -479,11 +494,13 @@ def fingerprint(
 ) -> str:
     """结果指纹，用于「相同输入两次运行输出一致」的复现校验（C14）。
 
-    覆盖排程决策与由其派生的两张输出表；理由文本是前者的纯函数，不重复计入。
+    逐字段取全：指纹是「相同输入输出一致」的判据本身，漏掉任何输出字段都会让该项
+    上的不确定性逃过检查。取值一律排序后再拼，避免哈希遍历顺序引入不确定（§16.1）。
 
-    逐字段取全：这些量当前虽可由已计入的字段推出，但指纹是「相同输入输出一致」
-    的判据本身，漏掉任何输出字段都会让该项上的不确定性逃过检查。
-    取值一律排序后再拼，避免哈希遍历顺序引入不确定（§16.1）。
+    理由文本（`reason_text`）必须计入。它曾被认为「是已计入字段的纯函数」而省略，
+    但订单级的 `reason_text` 是**推导**出来的：没有任何工单自身延期时，它由订单的
+    最早交期与最晚完成日生成（§13.2）。那是独立于已有字段的取值，省略它就等于
+    让这一类不确定性不被 C14 覆盖。
     """
     h = hashlib.sha256()
     for a in sorted(assignments, key=lambda x: x.work_order_no):
@@ -492,7 +509,8 @@ def fingerprint(
             f"{a.work_order_no}|{a.sales_order_no}|{a.product_type_code}|{a.pattern_code}|"
             f"{a.batch_no}|{a.press_no}|{a.set_no}|{a.mold_no}|{a.group_no}|"
             f"{a.plan_qty}|{a.cycles}|{a.start_slot}|{a.end_slot}|"
-            f"{a.delayed}|{a.delay_days}|{codes}|{a.bottleneck_resource}\n".encode()
+            f"{a.delayed}|{a.delay_days}|{codes}|{a.bottleneck_resource}|"
+            f"{a.reason_text}\n".encode()
         )
     for b in sorted(batches, key=lambda x: x.batch_no):
         surplus = ",".join(f"{p}={q}" for p, q in sorted(b.surplus.items()))
@@ -505,7 +523,7 @@ def fingerprint(
         h.update(
             f"{o.sales_order_no}|{o.due_date}|{o.expected_finish_date}|"
             f"{o.delayed}|{o.delay_days}|{o.bottleneck_resource}|"
-            f"{o.reason_code}\n".encode()
+            f"{o.reason_code}|{o.reason_text}\n".encode()
         )
     for r in sorted(release_plan or [], key=lambda x: (x.batch_no, x.pattern_code)):
         h.update(

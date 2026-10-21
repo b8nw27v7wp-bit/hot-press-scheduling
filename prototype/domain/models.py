@@ -154,6 +154,24 @@ class WorkOrder:
         )
 
 
+def is_preprocessable(wo: WorkOrder, product_type_codes=None) -> bool:
+    """§7 P0：工单能否进入排程。**这是该判据的单一来源。**
+
+    `is_schedulable` 只看状态与数量，不够：引擎的 P0 还会排除缺交期、缺牌型、
+    产品类型未定义的工单。校验器 C10 若只按 `is_schedulable` 判断「哪些工单应当
+    出现在结果里」，就会把引擎正确地跳过的工单算成漏排，把合规结果判为无效。
+
+    `product_type_codes` 为已定义的产品类型集合；传 None 表示调用方不掌握该信息，
+    此时跳过这一项（其余字段仍按同一口径判断）。
+    """
+    return (
+        wo.is_schedulable
+        and bool(wo.pattern_code)
+        and wo.due_date is not None
+        and (product_type_codes is None or wo.product_type_code in product_type_codes)
+    )
+
+
 @dataclass(frozen=True)
 class CalendarDay:
     day: date

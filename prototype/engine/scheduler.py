@@ -157,12 +157,23 @@ class Engine:
         # 的上限跑到 0.4s 以上而 truncated 仍为 False）。
         self._t0 = t0
         self._truncated = False
+        # 以下三项在排程过程中只增不减。同一个 Engine 被调用两次（复现校验、参数扫描
+        # 里的复用）时必须得到同一结果，所以每次进入都先清空——否则第二次调用的批号
+        # 会从 B00002 起，违反 §11.6「从 1 起连续」，异常表与理由表也会叠加。
+        self.exceptions = []
+        self._reasons = []
+        self._batch_seq = 1
         self._validate_resources()
         valid = self._preprocess()
 
         sets_by_type: dict[str, list[MoldSet]] = defaultdict(list)
         for s in self.mold_sets.values():
-            sets_by_type[s.product_type_code].append(s)
+            # 无可用模具的套（全在保养、或缺配比）不参与启用顺序。SET_ORDER 会把它排在
+            # 首位，而它一旦被选中就占掉一个组名额，却覆盖不到任何牌型 —— 整个类型
+            # 的工单会落 R008，即便后面的套完全够用。全部套都不可用时列表为空，
+            # 由下面的 `if not sets` 按「无可用模具」报 R008。
+            if s.available_molds:
+                sets_by_type[s.product_type_code].append(s)
         for lst in sets_by_type.values():
             lst.sort(key=lambda s: (s.set_order, s.set_no))
 
@@ -425,7 +436,12 @@ class Engine:
         """
         latest, days, slots = self._window_stats(orders)
         cap = min((p.capacity_per_shift for p in presses), default=0)
-        parallel = sum(max(1, min(self.params.group_size, s.mold_count)) for s in selected)
+        # 组按 group_size 顺序切分机台，末组可能不足 group_size 台，故逐组按实际机台数算
+        gs = self.params.group_size
+        parallel = sum(
+            self._effective_parallel(s, len(presses[i * gs : (i + 1) * gs]))
+            for i, s in enumerate(selected)
+        )
         return TypeDiagnostics(
             product_type_code=ptype,
             mold_set_count=len(sets),
@@ -630,6 +646,16 @@ class Engine:
             return 0
         return max(1, min(len(sets), len(presses) // self.params.group_size))
 
+    def _effective_parallel(self, mold_set: MoldSet, group_press_count: int) -> int:
+        """§5.6 有效并行度 = min(组内**实际**机台数, 套内可用模具副数)。
+
+        必须是实际机台数而不是配置的 group_size：组按 group_size 顺序切分机台，
+        末组可能不足 group_size 台（例如 1 台机配 group_size=2 时该组只有 1 台机）。
+        用配置值会按两倍产能估算，进而把「机台不够」误归到模具套数上，并把 R007
+        文案里的可完成模数写成实际能力的两倍。
+        """
+        return max(1, min(group_press_count, mold_set.mold_count))
+
     def _work_estimate(self, orders: list[WorkOrder], molds: list[Mold]) -> int:
         """§9.1 工作量下界：按销售订单分别取「单牌型总模数」的最大值再求和。
 
@@ -680,7 +706,10 @@ class Engine:
         if days == 0 or slots == 0:
             return 1
         cap = min(p.capacity_per_shift for p in presses)
-        parallel = max(1, min(self.params.group_size, mold_set.mold_count))
+        # 一组最多拿到 min(group_size, 机台总数) 台机；再受套内副数限制（§5.6）
+        parallel = self._effective_parallel(
+            mold_set, min(self.params.group_size, len(presses))
+        )
         # 一组在窗口内的总产能 = 组内并行度 × 机台班产能 × 窗口槽位数（全整数）
         per_group = max(1, parallel * cap * slots)
         return max(1, -(-work // per_group))
@@ -804,7 +833,9 @@ class Engine:
         group_parallel: dict[int, int] = {}
         for gi in range(len(group_presses)):
             mold_set = selected_sets[gi]
-            group_parallel[gi] = max(1, min(self.params.group_size, mold_set.mold_count))
+            group_parallel[gi] = self._effective_parallel(
+                mold_set, len(group_presses[gi])
+            )
 
         for w in orders:
             best_g = None

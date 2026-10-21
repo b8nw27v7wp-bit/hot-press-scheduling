@@ -45,7 +45,24 @@ def build_order_delivery(
         due = min(wo.due_date for wo, _ in items)
         finish = max(calendar.day_of(a.end_slot) for _, a in items)
         delay = work_order_delay(finish, due)
-        worst = max(items, key=lambda p: (p[1].delay_days, p[0].work_order_no))
+        # 订单级的 due/finish 取「最早交期 / 最晚完成」，与任何一张工单自身的延期
+        # 都未必同源：最晚完成的那张工单可能自己并不延期，于是 apply_attribution
+        # 没给它写归因文本。只按工单级 delay_days 挑「最重」的那张，就会挑到一张
+        # 文本为空的工单，令订单行 delayed=True 而 reason_text 为空——§4.3 的
+        # 「原因说明」形同虚设。故：优先取真正延期最重的工单；一张都没有时，退到
+        # 决定订单完成日的那张（它才是这一行延期的直接原因）。
+        delayed_items = [p for p in items if p[1].delayed]
+        source = (
+            max(delayed_items, key=lambda p: (p[1].delay_days, p[0].work_order_no))
+            if delayed_items
+            else max(items, key=lambda p: (p[1].end_slot, p[0].work_order_no))
+        )
+        reason_text = source[1].reason_text
+        if delay > 0 and not reason_text:
+            reason_text = (
+                f"本订单应交日期取各工单最早交期 {due}，而最晚完成工单 "
+                f"{source[0].work_order_no} 于 {finish} 完成，晚 {delay} 天"
+            )
         out.append(
             OrderDelivery(
                 sales_order_no=sales_no,
@@ -53,11 +70,9 @@ def build_order_delivery(
                 expected_finish_date=finish,
                 delayed=delay > 0,
                 delay_days=delay,
-                bottleneck_resource=worst[1].bottleneck_resource,
+                bottleneck_resource=source[1].bottleneck_resource,
                 reason_code=primary_reason([c for _, a in items for c in a.reason_codes]),
-                # §4.3 要求给出「原因说明」。取本订单延期最重的那张工单的归因文本，
-                # 与 bottleneck_resource 同源，否则该字段恒为空串。
-                reason_text=worst[1].reason_text,
+                reason_text=reason_text,
             )
         )
     return out
@@ -82,7 +97,18 @@ def attribute(
 
     禁止输出「产能不足」这类笼统描述，原因必须落到套数、机台数或日历上。
     """
-    if diag.daily_capacity > 0 and diag.working_days > 0:
+    # 窗口内一个生产日都没有，是本分支里最强的日历情形：加机台、加模具都不能改变它。
+    # 必须排在 daily_capacity 判断之前——working_days == 0 时 daily_capacity 按定义
+    # 就是 0（它是「总产能 ÷ 生产日数」，分母为 0 时取 0），原判据写成
+    # `daily_capacity > 0 and working_days > 0` 才进入，恰好把这一情形排除掉，
+    # 于是落到资源分支去报「模具套数不足」。
+    if diag.total_cycles > 0 and diag.working_days == 0:
+        return "R007", (
+            f"产品类型 {wo.product_type_code} 的交期窗口内没有任何生产日"
+            f"（需求 {diag.total_cycles} 模），日历生产日/班次不足"
+        )
+
+    if diag.daily_capacity > 0:
         needed_days = -(-diag.total_cycles // diag.daily_capacity)
         if needed_days > diag.working_days:
             return "R007", (
