@@ -118,7 +118,10 @@ def attribute(
             )
 
     sets_cap = diag.mold_set_count
-    press_cap = diag.press_count // group_size
+    # 与 _max_groups 的 `max(1, …)` 下限同口径（§9.2）：A < group_size 时按 §8.2「余数
+    # 单独成组」仍可开 1 组，此时 floor(A/group_size) 为 0，拿它比较会让 R006 永不命中，
+    # 归因落到兜底行、输出与事实相反的「未开满」（它其实正卡在组数上限上）。
+    press_cap = max(1, diag.press_count // group_size)
     saturated = diag.groups_used >= diag.max_groups > 0
 
     if saturated and diag.max_groups == sets_cap:

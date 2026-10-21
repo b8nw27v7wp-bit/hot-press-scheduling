@@ -271,6 +271,14 @@ def main() -> int:
                                                       max_groups=1, groups_needed=1, groups_used=1,
                                                       working_days=83, total_cycles=3013,
                                                       daily_capacity=80), "R006"),
+        # A < group_size（1 台机配 group_size=2）：§8.2「余数单独成组」仍可开 1 组，
+        # §9.2 的 max_groups 因此带 max(1, …) 下限。R006 的判据必须同口径，否则
+        # floor(1/2)=0 让它永不命中，归因落到兜底行、输出与事实相反的「未开满」
+        # （该类型其实正卡在组数上限上）。
+        ("A < group_size 仍归因设备不足 → R006", TypeDiagnostics("P01", mold_set_count=3,
+                                                                press_count=1, max_groups=1,
+                                                                groups_needed=1, groups_used=1),
+         "R006"),
     ]
     for name, diag, expected in cases:
         got, text = attribute(wo, diag, 2, date(2026, 2, 20))
@@ -953,6 +961,34 @@ def main() -> int:
     print(f"[{'PASS' if case55_ok else 'FAIL'}] 窗口内零生产日归因 R007"
           f"（{r55.assignments[0].reason_code if r55.assignments else '-'}）")
     results.append(case55_ok)
+
+    # 56. R001/R002 的窗口判据必须落到**日**。目标完成日是「交期 − 前置偏移」的日期差，
+    #     批次完成在同一目标日的第 2 班并不晚于它。此前判据拿槽位下标比「目标日的首个
+    #     槽位」，把这种批次判成 R002，理由文本还写出与事实相反的「晚于该窗口截止 X」。
+    #     5 张单槽位工单依次落位，第 3、4 张恰在目标日的两个班次完成。
+    one_mold = MoldSet("S1", "P01", 1, [mold("M1", "S1", 1, {"X": 10})])
+    target_day56 = date(2026, 1, 6)  # plan_start 次日，2 班制下的第 3、4 个槽位
+    due56 = target_day56 + timedelta(days=15)  # 前置偏移 15 天 → 目标完成日 == target_day56
+    _, r56 = run_case("R001/R002 按日判定", [
+        WorkOrder(f"WQ{i}", f"SO{i}", "P01", "X", D(10), "张", due56)
+        for i in range(1, 6)
+    ], {"S1": one_mold}, {"R1": Press("R1", 20, "P01")})
+    by_end = sorted(r56.assignments, key=lambda a: a.end_slot)
+    on_day56 = [a for a in by_end if r56.calendar.day_of(a.end_slot) == target_day56]
+    after56 = [a for a in by_end if r56.calendar.day_of(a.end_slot) > target_day56]
+    text56 = {r.work_order_no: r.time_reason for r in r56.reasons}
+    case56_ok = (
+        len(on_day56) == 2  # 目标日两个班次各完成一张
+        and all("R001" in a.reason_codes and "R002" not in a.reason_codes for a in on_day56)
+        and bool(after56)
+        and all("R002" in a.reason_codes for a in after56)
+        and all("晚于该窗口截止" not in text56[a.work_order_no] for a in on_day56)
+    )
+    print(f"[{'PASS' if case56_ok else 'FAIL'}] R001/R002 按日判定：完成日在目标日当天"
+          f"（含第 2 班）记 R001，晚于目标日才记 R002"
+          f"（目标日完成 {[a.work_order_no for a in on_day56]}，"
+          f"超窗口 {[a.work_order_no for a in after56]}）")
+    results.append(case56_ok)
 
     print()
     print(f"通过 {sum(results)}/{len(results)}")

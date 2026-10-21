@@ -897,7 +897,6 @@ class Engine:
                     break
                 batch_due = b_due[b.batch_no]  # 必须在重新分配批号之前取出
                 batch_target_day = capacity.target_finish(batch_due, self.params)
-                target_slot = self.calendar.first_slot_on_or_after(batch_target_day)
                 decision = scheduler.place_batch(b, plist, mold_set.available_molds, mold_tls)
                 if decision is None:
                     for no in b.work_order_nos:
@@ -928,6 +927,11 @@ class Engine:
                 e_slot = self.calendar.slot(placement.end)
                 b.start_date, b.start_shift = s_slot.day, s_slot.shift
                 b.end_date, b.end_shift = e_slot.day, e_slot.shift
+                # §12.3：R001/R002 判的是批次是否落在前置窗口内，判据必须落到**日**。
+                # 目标完成日是「交期 − 前置偏移」的日期差，完成在同一目标日的第 2 班
+                # 并不晚于它。此前拿槽位下标比「目标日的首个槽位」，会把这种批次判成
+                # R002，理由文本随之写出与事实相反的「晚于该窗口截止 <目标日>」。
+                within_window = e_slot.day <= batch_target_day
                 placed_batches.append(b)
 
                 for no in b.work_order_nos:
@@ -944,7 +948,7 @@ class Engine:
                     own = self.calendar.slot(end)
 
                     # R001/R002 判的是「是否落在前置窗口内」，与是否延期是两回事（§12.3）
-                    codes = ["R002"] if placement.end > target_slot else ["R001"]
+                    codes = ["R001"] if within_window else ["R002"]
                     if switched:
                         codes.append("R003")
                     if cyc > press.press.capacity_per_shift:
@@ -988,7 +992,7 @@ class Engine:
                             params=self.params,
                             target_day=batch_target_day,
                             batch_due=batch_due,
-                            within_window=placement.end <= target_slot,
+                            within_window=within_window,
                             finish_slot=end,
                             batch_orders=[by_no[n] for n in b.work_order_nos],
                             diag=diag,

@@ -72,9 +72,3 @@ class Calendar:
 
     def day_of(self, index: int) -> date:
         return self.slot(index).day
-
-    def first_slot_on_or_after(self, day: date) -> int:
-        for s in self._slots:
-            if s.day >= day:
-                return s.index
-        return len(self._slots)
