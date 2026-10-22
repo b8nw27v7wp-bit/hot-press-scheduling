@@ -157,15 +157,24 @@ def build():
     return params, product_types, mold_sets, presses, calendar_days, orders
 
 
-def measure(result, presses) -> dict:
-    """基线里记录的、跨版本可比的结果指标（§21.3 黄金数据集比对）。"""
-    stats = summarize(result.assignments, result.batches, presses, result.calendar)
+def measure(result, presses, params, orders) -> dict:
+    """基线里记录的、跨版本可比的结果指标（§21.3 黄金数据集比对）。
+
+    覆盖 §1 的四级目标：交期（延期订单数 → 总延期天数）、利用率/均衡、换模次数。
+    只记工单级延期会让「订单数没变差但订单级变差」的改动逃过基线。
+    """
+    stats = summarize(
+        result.assignments, result.batches, presses, result.calendar, params, orders
+    )
     return {
         "result_hash": fingerprint(
             result.assignments, result.batches, result.order_delivery, result.release_plan
         ),
-        "delayed_work_orders": stats["delayed_work_orders"],
+        "delayed_sales_orders": stats["delayed_sales_orders"],
         "total_delay_days": stats["total_delay_days"],
+        "delayed_work_orders": stats["delayed_work_orders"],
+        "window_utilization": round(stats["window_utilization"], 6),
+        "press_load_imbalance": round(stats["press_load_imbalance"], 6),
         "batches": len(result.batches),
         "release_plan_rows": len(result.release_plan),
         "changeover_count": stats["changeover_count"],
@@ -325,7 +334,7 @@ def main() -> int:
     ))
 
     # 11. §21.3 黄金数据集比对：与外部基线逐项比对
-    current = measure(result, presses)
+    current = measure(result, presses, params, orders)
     if update:
         baseline_doc = {
             "_comment": (

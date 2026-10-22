@@ -37,23 +37,25 @@ def _slot_text(calendar: Calendar, index: int) -> str:
 def machine_reason(
     wo: WorkOrder,
     decision: PlacementDecision,
-    group_no: int,
-    group_presses: list[Press],
+    set_index: int,
+    press_pool: list[Press],
     calendar: Calendar,
 ) -> str:
-    """§14.1 机台理由：适用类型匹配 + 同组绑定 + 组内最早可用。"""
-    peers = "、".join(p.press_no for p in sorted(group_presses, key=lambda p: p.press_no))
+    """§14.1 机台理由：38 台独立机台 + 全局并发上限 + 最早可用。"""
+    peers = "、".join(p.press_no for p in sorted(press_pool, key=lambda p: p.press_no))
     chosen = decision.press.press.press_no
     others = [
         f"{no} 最早可于 {_slot_text(calendar, start)} 开工"
         for no, start in decision.press_options
         if no != chosen
     ]
-    detail = f"；组内其他机台：{'；'.join(others)}" if others else "（组内仅此一台机）"
+    detail = f"；机台池其他机台：{'；'.join(others)}" if others else "（机台池仅此一台）"
     return (
-        f"本工单属于产品类型 {wo.product_type_code}，可用机台为 {peers}（同属第 {group_no + 1} 组，"
-        f"共用模具套 {decision.mold.set_no}）。按「开始槽位最早」比较，{chosen} 于 "
-        f"{_slot_text(calendar, decision.placement.start)} 最早可用，故分配 {chosen}{detail}。"
+        f"本工单属于产品类型 {wo.product_type_code}，可用机台池为 {peers}"
+        f"（独立机台，不固定成组；本批使用第 {set_index + 1} 套模具 {decision.mold.set_no}）。"
+        f"按 §12.3 的次序（开始槽位最早 → 同起点总占机时最少 → 负荷最轻 → 模具优先级）比较，"
+        f"{chosen} 于 {_slot_text(calendar, decision.placement.start)} 最早可用，"
+        f"故分配 {chosen}{detail}。"
     )
 
 
@@ -175,16 +177,22 @@ def mold_reason(
     )
     covering = [m for m in mold_set.available_molds if m.covers_all(batch_patterns)]
     top = covering[0] if covering else mold
+    # R003 的成因不止「被其他机台占用」：§12.3 的比较次序里，同等开始槽位下
+    # 「总占机时更少」也会选中另一副模具。文案不得断言某一种成因，只能陈述
+    # 「按该次序比较后未被选中」，否则理由与事实不符（§14「每个决策都能落到规则上」）。
+    order_text = "开始槽位最早 → 同起点总占机时最少 → 负荷最轻"
     why = (
-        f"覆盖本批次牌型的最高优先级模具 {top.mold_no}（优先级 {top.priority}）已被其他机台占用，"
-        f"改用次优先模具以保证不空转（R003）"
+        f"覆盖本批次牌型的最高优先级模具 {top.mold_no}（优先级 {top.priority}）"
+        f"按 §12.3 的次序（{order_text}）比较后未被选中——要么开工更晚，"
+        f"要么同起点下占机时更多——改用 {mold.mold_no} 以避免机台空转（R003）"
         if switched
-        else f"在覆盖本批次牌型（{'、'.join(sorted(batch_patterns))}）的模具中，"
-        f"{mold.mold_no} 优先级 {mold.priority} 最高，故优先使用"
+        else f"覆盖本批次牌型（{'、'.join(sorted(batch_patterns))}）的模具中，"
+        f"{mold.mold_no} 按 §12.3 的次序（{order_text}）比较最优"
+        f"（其优先级 {mold.priority}），故选用"
     )
     return (
         f"产品类型 {mold_set.product_type_code} 共 {len(all_sets)} 套模具，本次启用 {enabled} 套，"
-        f"本组绑定 {mold_set.set_no}。选用 {mold.mold_no}（{'多点' if len(mold.patterns) > 1 else '单点'}，"
+        f"本批绑定 {mold_set.set_no}。选用 {mold.mold_no}（{'多点' if len(mold.patterns) > 1 else '单点'}，"
         f"覆盖 {covers}）：{why}{alt}。"
     )
 
@@ -202,9 +210,14 @@ def sensitivity_note(
     finish_day = calendar.day_of(assignment.end_slot)
     parts = [f"本工单延期 {assignment.delay_days} 天（完成 {finish_day}，交期 {wo.due_date}）"]
     if diag.groups_needed > diag.max_groups:
+        cap_text = (
+            f"全局并发上限 {diag.concurrency_cap} 台"
+            if diag.concurrency_cap > 0
+            else "未设并发上限"
+        )
         parts.append(
-            f"需求 {diag.groups_needed} 组而当前上限 {diag.max_groups} 组"
-            f"（{diag.mold_set_count} 套模具 / {diag.press_count} 台机台）"
+            f"需求 {diag.groups_needed} 套而当前上限 {diag.max_groups} 套"
+            f"（{diag.mold_set_count} 套模具 / {diag.press_count} 台机台 / {cap_text}）"
         )
     # 只陈述算式与当前取值。不能写「减少前置偏移就提前」——目标完成日 = 交期 -
     # 前置偏移，减少它只会把目标完成日**推后**，且在早于计划起点时被钳到计划起点
@@ -224,7 +237,7 @@ def build_reason(
     mold_set: MoldSet,
     all_sets: list[MoldSet],
     decision: PlacementDecision,
-    group_presses: list[Press],
+    press_pool: list[Press],
     calendar: Calendar,
     params: Params,
     target_day: date,
@@ -236,7 +249,7 @@ def build_reason(
 ) -> ScheduleReason:
     return ScheduleReason(
         work_order_no=wo.work_order_no,
-        machine_reason=machine_reason(wo, decision, assignment.group_no, group_presses, calendar),
+        machine_reason=machine_reason(wo, decision, assignment.group_no, press_pool, calendar),
         time_reason=time_reason(
             wo,
             decision,

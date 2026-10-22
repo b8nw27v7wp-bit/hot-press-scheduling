@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+from fractions import Fraction
 
 from domain.models import Batch, Mold, Params, Press
 from engine.calendar import Calendar
@@ -31,6 +32,10 @@ class PressTimeline:
     intervals: list[Interval] = field(default_factory=list)  # 按 start 升序，互不重叠
     cursor: int = 0  # 严格追加指针：不回填时任务的搜索起点
     first_free: int = 0  # 首个仍有剩余产能的槽位：回填时的搜索起点
+    # 已提交的总模数（含换模消耗），供 §12.3 的「均衡」平局项使用。
+    # 必须单独累计而不是每次候选去 sum(used)：used 的长度是整条地平线，
+    # 逐候选求和会让每次评估退化成 O(槽位数)。
+    committed: int = 0
 
     def ensure(self, n: int) -> None:
         if len(self.used) < n:
@@ -60,6 +65,35 @@ class MoldTimeline:
             self.busy.extend([False] * (n - len(self.busy)))
 
 
+@dataclass
+class ConcurrencyTimeline:
+    """全局并行机台上限：每个槽位同时运行的批次数不得超过 limit。
+
+    每台机独立运行，批次只要占一台机就在该槽位计 1；不关心是哪台机。
+    `limit <= 0` 表示不限制。
+    """
+
+    limit: int
+    used: list[int] = field(default_factory=list)
+
+    def ensure(self, n: int) -> None:
+        if len(self.used) < n:
+            self.used.extend([0] * (n - len(self.used)))
+
+    def free(self, slot: int) -> bool:
+        if self.limit <= 0:
+            return True
+        self.ensure(slot + 1)
+        return self.used[slot] < self.limit
+
+    def commit(self, start: int, end: int) -> None:
+        if self.limit <= 0:
+            return
+        self.ensure(end + 1)
+        for s in range(start, end + 1):
+            self.used[s] += 1
+
+
 @dataclass(frozen=True)
 class Placement:
     start: int
@@ -80,17 +114,27 @@ class PlacementDecision:
 
 
 class Scheduler:
-    def __init__(self, calendar: Calendar, params: Params):
+    def __init__(
+        self,
+        calendar: Calendar,
+        params: Params,
+        concurrency: ConcurrencyTimeline | None = None,
+    ):
         self.calendar = calendar
         self.params = params
         self._n = len(calendar)
+        # 全局并行上限由 run() 建一条并跨产品类型共享；不传表示不限制。
+        self.conc = concurrency or ConcurrencyTimeline(0)
 
     # ---------- 评估（只读） ----------
 
+    def _slot_free(self, press: PressTimeline, mold_tl: MoldTimeline, slot: int) -> bool:
+        return press.used[slot] == 0 and not mold_tl.busy[slot] and self.conc.free(slot)
+
     def _free_run_end(self, press: PressTimeline, mold_tl: MoldTimeline, start: int) -> int:
-        """从 start 起的「机台空且模具空」连续区间的结束槽位（含）；start 本身不空闲则为 start-1。"""
+        """从 start 起的「机台空且模具空且并发未满」连续区间的结束槽位（含）。"""
         s = start
-        while s < self._n and press.used[s] == 0 and not mold_tl.busy[s]:
+        while s < self._n and self._slot_free(press, mold_tl, s):
             s += 1
         return s - 1
 
@@ -104,7 +148,7 @@ class Scheduler:
         """
         limit = min(self._n, start + need)
         s = start
-        while s < limit and press.used[s] == 0 and not mold_tl.busy[s]:
+        while s < limit and self._slot_free(press, mold_tl, s):
             s += 1
         return s - start >= need
 
@@ -147,7 +191,7 @@ class Scheduler:
         # 不回填：只能从追加游标起单调追加（§12.6）。
         start = press.first_free if self.params.backfill_gaps else press.cursor
         while start < self._n:
-            if press.used[start] != 0 or mold_tl.busy[start]:
+            if not self._slot_free(press, mold_tl, start):
                 start += 1
                 continue
             chg = self._changeover_for(press, start, mold.mold_no, base_chg)
@@ -187,6 +231,8 @@ class Scheduler:
                 cur += 1
         for s in range(placement.start, placement.end + 1):
             mold_tl.busy[s] = True
+        self.conc.commit(placement.start, placement.end)
+        press.committed += placement.changeover + cycles
         press.intervals.append(
             Interval(placement.start, placement.end, mold_tl.mold_no, placement.changeover)
         )
@@ -209,11 +255,30 @@ class Scheduler:
         molds: list[Mold],
         mold_tls: dict[str, MoldTimeline],
     ) -> PlacementDecision | None:
-        """选机台与模具（§12.3）。
+        """选机台与模具（§12.3），按 §1 的四级优先次序取字典序最小者：
+
+        | 键 | 服务于 | 含义 |
+        | --- | --- | --- |
+        | `pl.start` | 交期 + 利用率 | 开始槽位最早：批次尽早完成，且不留空闲 |
+        | `pl.changeover + cycles` | 利用率 + 交期 | 同等起点下**总占机时**最少 |
+        | `负荷 / 班产能` | 均衡 | 同等起点下取归一后负荷最轻的机台 |
+        | `priority_index` | §12.3 既有规则 | 覆盖该批次的最高优先级模具优先 |
+        | `press_no` | 确定性 | §16.1 |
 
         第一键是「开始槽位最早」，让组内空闲机台立刻取用当前可用的最高优先级模具，
-        从而按 §5.6 的有效并行度 min(组内机台数, 套内模具副数) 并行开工；
-        同一开始时间下先按模具 priority 升序，再按机台号升序。
+        从而按 §5.6 的有效并行度 min(组内机台数, 套内模具副数) 并行开工。
+
+        **第二键为什么是「换模 + 模数」而不是单看换模**：同等起点下占机时更少，既是
+        利用率（少占设备时间），也让本批更早完成（交期）。只按「换模最少」择优是**短视**
+        的——为省 4 模换模去选一副要多跑几十模的模具，实测在 1 万工单基准上会把延期订单
+        从 76 抬到 155、总延期天数从 323 抬到 1167。故换模只作为总机时的一项加数参与，
+        不单独成键（见 §24.1 的实测记录）。
+
+        负荷用 `Fraction` 比较、且按机台自身班产能归一：沿用 §10.2 的既有做法，满足
+        §16.1「离散决策路径无浮点」，同时不偏袒快机台。
+
+        低优先的几项都是**严格平局项**——只在更高优先的键相同时才生效，因此不会牺牲
+        交期与利用率（§1「任何利用率或换模优化都不得以牺牲交期为代价」）。
 
         若最终没用上覆盖该批次牌型的最高优先级模具，即为「改用次优先模具」（R003）。
         """
@@ -224,6 +289,7 @@ class Scheduler:
         candidates: list[tuple[tuple, PressTimeline, Mold, Placement, int]] = []
         per_press_best: dict[str, tuple[int, str]] = {}
         for press in press_order:
+            capacity = press.press.capacity_per_shift
             for mold in by_priority:
                 cycles = batch.cycles_by_mold.get(mold.mold_no)
                 if cycles is None:
@@ -231,7 +297,14 @@ class Scheduler:
                 pl = self.evaluate(press, mold, mold_tls[mold.mold_no], cycles)
                 if pl is None:
                     continue
-                key = (pl.start, priority_index[mold.mold_no], press.press.press_no)
+                load_after = press.committed + pl.changeover + cycles
+                key = (
+                    pl.start,
+                    pl.changeover + cycles,
+                    Fraction(load_after, capacity) if capacity > 0 else Fraction(0),
+                    priority_index[mold.mold_no],
+                    press.press.press_no,
+                )
                 candidates.append((key, press, mold, pl, cycles))
                 no = press.press.press_no
                 if no not in per_press_best or pl.start < per_press_best[no][0]:

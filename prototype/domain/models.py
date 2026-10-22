@@ -120,10 +120,24 @@ class MoldSet:
 
 @dataclass(frozen=True)
 class Press:
+    """一台热压机。现场 38 台可独立运行，不再按「两台一组」固定配对。
+
+    `product_type_code = "*"` 表示通用机，可服务任意产品类型；给具体类型则表示
+    专用机，只做该类型。机台时间轴按 `press_no` 全局共享，通用机可在不同时段做
+    不同类型（A2 不再假设单归属）。
+    """
+
     press_no: str
     capacity_per_shift: int
-    product_type_code: str
+    product_type_code: str = "*"
     status: ResourceStatus = ResourceStatus.AVAILABLE
+
+    @property
+    def is_general(self) -> bool:
+        return self.product_type_code in ("", "*")
+
+    def serves(self, product_type_code: str) -> bool:
+        return self.is_general or self.product_type_code == product_type_code
 
 
 @dataclass
@@ -186,7 +200,8 @@ class CalendarDay:
 @dataclass(frozen=True)
 class Params:
     plan_start: date
-    group_size: int = 2
+    # 现场：38 台机器、19 人、一人两台，同时开 19 台。0 表示不限制（仅用于合成测试）。
+    max_concurrent_presses: int = 19
     pre_offset_days: int = 15
     shift_hours: int = 12
     changeover_hours: int = 2
@@ -302,7 +317,11 @@ class OrderDelivery:
 
 @dataclass
 class TypeDiagnostics:
-    """单个产品类型的排程诊断，供 §13.3 瓶颈归因使用。"""
+    """单个产品类型的排程诊断，供 §13.3 瓶颈归因使用。
+
+    `max_groups` / `groups_needed` / `groups_used` 是历史字段名，现在表示**模具套数**
+    （独立机台模型下不再有物理「组」）。`concurrency_cap` 是全局并行机台上限。
+    """
 
     product_type_code: str
     mold_set_count: int = 0
@@ -314,6 +333,7 @@ class TypeDiagnostics:
     latest_target: date | None = None
     total_cycles: int = 0
     daily_capacity: int = 0
+    concurrency_cap: int = 0
 
 
 @dataclass

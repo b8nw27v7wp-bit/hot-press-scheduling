@@ -109,6 +109,7 @@ def check_all(
     )
     errors: list[str] = []
     errors += _check_press_no_overlap(ctx)          # C01
+    errors += _check_concurrency(ctx)               # C16：全局并行上限
     errors += _check_mold_serialization(ctx)        # C02
     errors += _check_within_calendar(ctx)           # C03
     errors += _check_press_product_type(ctx)        # C04
@@ -140,6 +141,30 @@ def _check_press_no_overlap(ctx: _Context) -> list[str]:
             if s2 <= e1:
                 errs.append(f"C01 机台 {press_no} 批次重叠：{b1}({s1}-{e1}) 与 {b2}({s2}-{e2})")
     return errs
+
+
+# ---------------- C16 ----------------
+
+def _check_concurrency(ctx: _Context) -> list[str]:
+    """全局并行机台上限：每个槽位同时运行的批次数不得超过 `max_concurrent_presses`。
+
+    现场 38 台机独立运行、19 人一人两台，同时最多开 19 台。机台归属、模具、
+    换模都合规，但总量超过 19 台同样是不可执行的计划，故必须独立检查。
+    """
+    limit = ctx.params.max_concurrent_presses
+    if limit <= 0:
+        return []
+    used: dict[int, int] = defaultdict(int)
+    for b in ctx.batches:
+        if b.start_slot < 0:
+            continue
+        for s in range(b.start_slot, b.end_slot + 1):
+            used[s] += 1
+    return [
+        f"C16 槽位 {s} 同时运行 {n} 个批次，超过全局并发上限 {limit}"
+        for s, n in sorted(used.items())
+        if n > limit
+    ]
 
 
 # ---------------- C02 ----------------
@@ -188,7 +213,7 @@ def _check_press_product_type(ctx: _Context) -> list[str]:
             errs.append(f"C04 工单 {a.work_order_no} 引用了不存在的机台 {a.press_no}")
         elif p.status is not ResourceStatus.AVAILABLE:
             errs.append(f"C04 工单 {a.work_order_no} 排到非可用机台 {a.press_no}（{p.status.value}）")
-        elif p.product_type_code != a.product_type_code:
+        elif not p.is_general and p.product_type_code != a.product_type_code:
             errs.append(
                 f"C04 工单 {a.work_order_no} 排到不适用的机台 {a.press_no}"
                 f"（{p.product_type_code} != {a.product_type_code}）"
@@ -230,30 +255,26 @@ def _check_mold_belongs_to_type(ctx: _Context) -> list[str]:
 # ---------------- C06 ----------------
 
 def _check_set_single_group(ctx: _Context) -> list[str]:
-    """同一套模具同一时刻只能被一组使用。
+    """同一模具套内，同一副模具同一时刻只能被一个批次使用。
 
-    必须比较**任意**跨组区间对，不能只比较排序后的相邻对：同一组的两条批次
-    若夹在中间，会把「组 A 的长区间」与「组 B 的区间」隔开，相邻比较看不到重叠。
-    按 start 排序后，只要区间 i 与更靠后的区间重叠就必然满足 `s2 <= e1`，
-    故内层在 `s2 > e1` 时即可终止。
+    独立机台模型下，「一组独占一套模具」不再成立：一套里的多副模具可以同时装到
+    多台机上。真正的硬约束是**一副模具同一时刻只在一台机上**（C02 已按模具号全局
+    检查）；本项再按（套, 模具号）检查，兜住同一模具号跨套出现的资料错误。
     """
-    by_set = defaultdict(list)
+    by_key = defaultdict(list)
     for b in ctx.batches:
         if b.start_slot < 0:
             continue
-        by_set[b.set_no].append((b.start_slot, b.end_slot, b.group_no, b.batch_no))
+        by_key[(b.set_no, b.mold_no)].append((b.start_slot, b.end_slot, b.batch_no))
     errs = []
-    for set_no, items in by_set.items():
+    for (set_no, mold_no), items in by_key.items():
         items.sort()
-        for i, (s1, e1, g1, b1) in enumerate(items):
-            for s2, e2, g2, b2 in items[i + 1:]:
-                if s2 > e1:
-                    break
-                if g1 != g2:
-                    errs.append(
-                        f"C06 模具套 {set_no} 同时被组 {g1}（{b1}）与组 {g2}（{b2}）占用"
-                        f"：{s1}-{e1} 与 {s2}-{e2}"
-                    )
+        for (s1, e1, b1), (s2, e2, b2) in zip(items, items[1:]):
+            if s2 <= e1:
+                errs.append(
+                    f"C06 模具套 {set_no} 的模具 {mold_no} 时间重叠："
+                    f"{b1}({s1}-{e1}) 与 {b2}({s2}-{e2})"
+                )
     return errs
 
 
@@ -548,6 +569,52 @@ def _target_finish(due, params: Params):
     return max(due - timedelta(days=params.pre_offset_days), params.plan_start)
 
 
+def _type_windows(params: Params, orders: list[WorkOrder]) -> dict[str, object]:
+    """每个产品类型的交期窗口截止日（该类型最晚的 target_finish）。"""
+    latest: dict[str, object] = {}
+    for w in orders:
+        if w.due_date is None:
+            continue
+        t = _target_finish(w.due_date, params)
+        if w.product_type_code not in latest or t > latest[w.product_type_code]:
+            latest[w.product_type_code] = t
+    return latest
+
+
+def _window_presses(
+    assignments: list[Assignment],
+    presses: dict[str, Press],
+    calendar: Calendar,
+    latest: dict[str, object],
+) -> list[tuple[str, int]]:
+    """已排产品类型的 AVAILABLE 机台，及其在交期窗口内的产能（模）。
+
+    只取「有工单排入的产品类型」的机台：未排类型的机台恒为 0 负荷，混进来会把
+    利用率与均衡度一起稀释。窗口是各类型自己的交期窗口，与 §19 的地平线无关。
+    """
+    scheduled_types = {a.product_type_code for a in assignments}
+    out: list[tuple[str, int]] = []
+    for p in presses.values():
+        if p.status is not ResourceStatus.AVAILABLE:
+            continue
+        if p.is_general:
+            untils = [latest[t] for t in scheduled_types if t in latest]
+            if not untils:
+                continue
+            until = max(untils)
+        else:
+            if p.product_type_code not in scheduled_types:
+                continue
+            until = latest.get(p.product_type_code)
+            if until is None:
+                continue
+        out.append((
+            p.press_no,
+            p.capacity_per_shift * sum(1 for s in calendar.slots if s.day <= until),
+        ))
+    return out
+
+
 def _window_utilization(
     assignments: list[Assignment],
     batches: list[Batch],
@@ -565,29 +632,63 @@ def _window_utilization(
     按最悲观产能外推，远长于需求实际占用的区间，因此天然偏低。判断「产能是否真的
     富余」要看本指标。
     """
-    latest: dict[str, object] = {}
-    for w in orders:
-        if w.due_date is None:
-            continue
-        t = _target_finish(w.due_date, params)
-        if w.product_type_code not in latest or t > latest[w.product_type_code]:
-            latest[w.product_type_code] = t
-
-    scheduled_types = {a.product_type_code for a in assignments}
-    window_available = 0
-    for p in presses.values():
-        if p.status is not ResourceStatus.AVAILABLE:
-            continue
-        if p.product_type_code not in scheduled_types:
-            continue
-        until = latest.get(p.product_type_code)
-        if until is None:
-            continue
-        window_available += p.capacity_per_shift * sum(
-            1 for s in calendar.slots if s.day <= until
+    window_available = sum(
+        cap for _, cap in _window_presses(
+            assignments, presses, calendar, _type_windows(params, orders)
         )
+    )
     used = sum(b.cycles + b.changeover_cycles for b in batches)
     return (used / window_available) if window_available else 0.0
+
+
+def _press_load_imbalance(
+    assignments: list[Assignment],
+    batches: list[Batch],
+    presses: dict[str, Press],
+    calendar: Calendar,
+    params: Params,
+    orders: list[WorkOrder],
+) -> float:
+    """各机台负荷的极差：按各自窗口产能归一后的利用率，取 max - min。
+
+    0 表示完全均衡。与 window_utilization 共用同一分母基准，两者互补——后者是
+    **均值**（整体用了多少），本项是**离散度**（匀不匀）；只看均值看不出「一台机
+    忙满、另一台空着」。
+
+    零负荷机台要计入（它们正是「设备空闲」），故不按「有批次」过滤；但未排产品
+    类型的机台必须排除，否则极差会被一片 0 淹没。
+    """
+    window = _window_presses(
+        assignments, presses, calendar, _type_windows(params, orders)
+    )
+    used_by_press: dict[str, int] = defaultdict(int)
+    for b in batches:
+        used_by_press[b.press_no] += b.cycles + b.changeover_cycles
+    utils = [used_by_press.get(no, 0) / cap for no, cap in window if cap > 0]
+    return (max(utils) - min(utils)) if len(utils) > 1 else 0.0
+
+
+def _delayed_sales_orders(
+    assignments: list[Assignment],
+    by_no: dict[str, WorkOrder],
+    calendar: Calendar,
+) -> int:
+    """订单级延期数（§13.2）：应交日期取该订单各工单的最早交期，完成日取最晚。
+
+    刻意不复用 `engine.delay` 的实现：校验器与求解器共享同一份公式时，公式本身
+    写错会两边一起错，校验就失去意义。
+    """
+    by_order: dict[str, list[tuple[WorkOrder, Assignment]]] = defaultdict(list)
+    for a in assignments:
+        wo = by_no.get(a.work_order_no)
+        if wo is not None:
+            by_order[a.sales_order_no].append((wo, a))
+    return sum(
+        1
+        for items in by_order.values()
+        if max(calendar.day_of(a.end_slot) for _, a in items)
+        > min(wo.due_date for wo, _ in items)
+    )
 
 
 def summarize(
@@ -598,10 +699,11 @@ def summarize(
     params: Params | None = None,
     orders: list[WorkOrder] | None = None,
 ) -> dict:
-    """§17 要求的统计口径。订单级延期由 §4.3 order_delivery 单独给出。
+    """§17 要求的统计口径。
 
     press_utilization 的分母是整个计划地平线，见 _window_utilization 的说明；
-    传入 params 与 orders 时额外给出 window_utilization。
+    传入 params 与 orders 时额外给出 window_utilization 与 press_load_imbalance，
+    传入 orders 时额外给出 delayed_sales_orders。**既有键一律不变**，避免报告口径漂移。
     """
     n_slots = len(calendar)
     available = sum(
@@ -623,8 +725,15 @@ def summarize(
         "scheduled_work_orders": len(assignments),
         "batch_count": len(batches),
     }
+    if orders is not None:
+        stats["delayed_sales_orders"] = _delayed_sales_orders(
+            assignments, {w.work_order_no: w for w in orders}, calendar
+        )
     if params is not None and orders is not None:
         stats["window_utilization"] = _window_utilization(
+            assignments, batches, presses, calendar, params, orders
+        )
+        stats["press_load_imbalance"] = _press_load_imbalance(
             assignments, batches, presses, calendar, params, orders
         )
     return stats

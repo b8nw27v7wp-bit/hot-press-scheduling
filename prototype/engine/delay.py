@@ -81,21 +81,20 @@ def build_order_delivery(
 def attribute(
     wo: WorkOrder,
     diag: TypeDiagnostics,
-    group_size: int,
+    concurrency_cap: int,
     finish_day: date,
 ) -> tuple[str, str]:
     """§13.3 瓶颈归因，取首个命中项。返回 (原因码, 具体原因文本)。
 
     判定顺序为**日历 → 资源上限 → 兜底**。日历排在资源之前：生产日或班次不够不是
-    加机台、加模具能解决的，先报出来才有指向性；反之若日历够用而组数已开满，
+    加机台、加模具能解决的，先报出来才有指向性；反之若日历够用而套数/并发已开满，
     那才是资源数量的问题。
 
-    资源分支以「已开满组数上限」为判据，**不用** §9.3 的 `groups_needed`：后者是为
-    §9.4 组数迭代算的下界估算（偏乐观），拿它当诊断判据会把「已开满、再加一组确实
-    能缓解」的延期误判成非资源原因。§9.4 只在上一组数仍有延期时才加组，因此走到
-    「开满且仍延期」即说明组数就是限制。
+    独立机台模型下，「组」已不存在：`max_groups` 表示可启用的模具套数，
+    `press_cap` 表示 min(适用机台数, 全局并发上限)。资源分支以「已启用满」为判据，
+    不用 `groups_needed`（它是偏乐观的下界估算）。
 
-    禁止输出「产能不足」这类笼统描述，原因必须落到套数、机台数或日历上。
+    禁止输出「产能不足」这类笼统描述，原因必须落到套数、机台数/并发上限或日历上。
     """
     # 窗口内一个生产日都没有，是本分支里最强的日历情形：加机台、加模具都不能改变它。
     # 必须排在 daily_capacity 判断之前——working_days == 0 时 daily_capacity 按定义
@@ -118,25 +117,25 @@ def attribute(
             )
 
     sets_cap = diag.mold_set_count
-    # 与 _max_groups 的 `max(1, …)` 下限同口径（§9.2）：A < group_size 时按 §8.2「余数
-    # 单独成组」仍可开 1 组，此时 floor(A/group_size) 为 0，拿它比较会让 R006 永不命中，
-    # 归因落到兜底行、输出与事实相反的「未开满」（它其实正卡在组数上限上）。
-    press_cap = max(1, diag.press_count // group_size)
+    # 全局并行上限 0 表示不限；否则按 min(适用机台数, 并发上限) 比较。
+    concurrency = concurrency_cap if concurrency_cap > 0 else diag.press_count
+    press_cap = min(diag.press_count, concurrency)
     saturated = diag.groups_used >= diag.max_groups > 0
 
     if saturated and diag.max_groups == sets_cap:
         return "R005", (
-            f"产品类型 {wo.product_type_code} 仅配 {sets_cap} 套模具，最多开动 "
-            f"{diag.max_groups} 组且已开满，模具套数不足"
+            f"产品类型 {wo.product_type_code} 仅配 {sets_cap} 套模具，最多启用 "
+            f"{diag.max_groups} 套且已启用满，模具套数不足"
         )
     if saturated and diag.max_groups == press_cap:
         return "R006", (
-            f"产品类型 {wo.product_type_code} 适用机台 {diag.press_count} 台，按每组 "
-            f"{group_size} 台最多开动 {diag.max_groups} 组且已开满，设备数量不足"
+            f"产品类型 {wo.product_type_code} 适用机台 {diag.press_count} 台，"
+            f"全局并发上限 {concurrency} 台，最多同时开 {diag.max_groups} 台且已开满，"
+            f"设备/并行机位不足"
         )
     return "R005", (
-        f"产品类型 {wo.product_type_code} 已开动 {diag.groups_used} 组（上限 "
-        f"{diag.max_groups} 组）未开满，工单 {wo.work_order_no} 于 {finish_day} 完成，"
+        f"产品类型 {wo.product_type_code} 已启用 {diag.groups_used} 套（上限 "
+        f"{diag.max_groups} 套）未启用满，工单 {wo.work_order_no} 于 {finish_day} 完成，"
         f"晚于交期 {wo.due_date}，受排程顺序限制"
     )
 
@@ -146,7 +145,7 @@ def apply_attribution(
     orders: dict[str, WorkOrder],
     diagnostics: dict[str, TypeDiagnostics],
     calendar,
-    group_size: int,
+    concurrency_cap: int,
 ) -> None:
     """就地写入延期工单的瓶颈归因。"""
     for a in assignments:
@@ -156,7 +155,7 @@ def apply_attribution(
         diag = diagnostics.get(a.product_type_code)
         if wo is None or diag is None:
             continue
-        code, text = attribute(wo, diag, group_size, calendar.day_of(a.end_slot))
+        code, text = attribute(wo, diag, concurrency_cap, calendar.day_of(a.end_slot))
         a.reason_codes.append(code)
         a.bottleneck_resource = text
         a.reason_text = text

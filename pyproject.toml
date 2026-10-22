@@ -3,3 +3,7 @@ name = "rypc"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = []
+
+[project.optional-dependencies]
+# 读取 ERP 导出的 .xls（BIFF 二进制，标准库无法解析）。核心引擎仍为零依赖。
+erp = ["xlrd>=2.0"]

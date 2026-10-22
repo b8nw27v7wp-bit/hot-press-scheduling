@@ -147,7 +147,7 @@ def main() -> int:
     )
     n_molds = sum(len(s.molds) for s in mold_sets.values())
     n_slots = len(result.calendar)
-    delayed_orders = sum(1 for o in result.order_delivery if o.delayed)
+    delayed_orders = stats["delayed_sales_orders"]
 
     print(f"工单 {len(orders)}  类型 {len(product_types)}  机台 {len(presses)}  "
           f"模具 {n_molds}  套 {len(mold_sets)}  槽位 {n_slots}")
@@ -155,11 +155,14 @@ def main() -> int:
           f"异常 {len(result.exceptions)}")
     print(f"延期工单 {stats['delayed_work_orders']}（{stats['delayed_work_orders'] / len(orders):.1%}）"
           f"  总延期天数 {stats['total_delay_days']}")
-    print(f"延期订单 {delayed_orders}（{delayed_orders / max(1, len(result.order_delivery)):.1%}）")
+    print(f"延期订单 {delayed_orders}（{delayed_orders / max(1, len(result.order_delivery)):.1%}）"
+          f"  与 order_delivery 一致：{delayed_orders == sum(1 for o in result.order_delivery if o.delayed)}")
     print(f"设备利用率 {stats['press_utilization']:.1%}（分母为整个计划地平线 {n_slots} 槽，"
           f"由 §19 悲观外推，故偏低）")
     print(f"交期窗口内利用率 {stats['window_utilization']:.1%}"
           f"（分母为各类型交期窗口内的机台产能，判断产能是否富余看这个）")
+    print(f"机台负荷极差 {stats['press_load_imbalance']:.1%}"
+          f"（各机台归一后利用率的 max-min，0 = 完全均衡）")
     print(f"换模 {stats['changeover_count']} 次  超产 {stats['surplus_qty']}")
     print(f"计算耗时 {elapsed:.2f}s  校验耗时 {check_elapsed:.2f}s")
 

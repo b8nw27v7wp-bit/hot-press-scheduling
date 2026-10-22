@@ -57,7 +57,7 @@ def measure(build_kw: dict | None = None, param_kw: dict | None = None) -> dict:
         )
         acc["延期工单"] += s["delayed_work_orders"]
         acc["总延期天数"] += s["total_delay_days"]
-        acc["延期订单"] += sum(1 for o in result.order_delivery if o.delayed)
+        acc["延期订单"] += s["delayed_sales_orders"]
         acc["换模次数"] += s["changeover_count"]
         acc["窗口内利用率"] += s["window_utilization"]
     out = {k: acc[k] / len(SEEDS) for k in METRICS}

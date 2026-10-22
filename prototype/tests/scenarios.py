@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import sys
 from datetime import date, timedelta
 from decimal import Decimal
@@ -989,6 +990,101 @@ def main() -> int:
           f"（目标日完成 {[a.work_order_no for a in on_day56]}，"
           f"超窗口 {[a.work_order_no for a in after56]}）")
     results.append(case56_ok)
+
+    # 57. §9.4 组数迭代必须按 (延期订单数, 总延期天数) 字典序**择优**，而不是「加到
+    #     开满、取最后一次尝试」。组数更多通常交期更好，但**不是单调的**：本数据集上
+    #     g=4 只有 1 个延期订单，g=5 反而有 4 个（总延期天数也是 4 > 2）。旧实现取
+    #     g=5，首要指标更差。这里同时断言「确实迭代了多轮」「采纳的是字典序最优」「它
+    #     不等于最后一次尝试」——最后一条正是旧实现会踩到的坑。
+    from engine import scheduler as _sched  # noqa: E402
+
+    attempts: list[tuple[int, tuple[int, int]]] = []
+    _orig_schedule = _sched.Engine._schedule_type
+
+    def _traced(self, ptype, orders, sets, presses, g, ordered_sets, g_needed,
+                max_groups, mold_tls):
+        out = _orig_schedule(self, ptype, orders, sets, presses, g, ordered_sets,
+                             g_needed, max_groups, mold_tls)
+        attempts.append((g, _sched.delivery_key(out[0])))
+        return out
+
+    rng57 = random.Random(82)
+    sets57 = {
+        f"S{i}": MoldSet(f"S{i}", "P01", i + 1, [
+            mold(f"M{i}{j}", f"S{i}", j + 1, {"X": rng57.choice([1, 10, 50])})
+            for j in range(2)
+        ])
+        for i in range(6)
+    }
+    presses57 = {
+        f"R{i:02d}": Press(f"R{i:02d}", rng57.choice([20, 24, 30]), "P01")
+        for i in range(10)
+    }
+    orders57 = [
+        WorkOrder(f"W{i:03d}", f"SO{i % 12}", "P01", "X", D(rng57.randint(20, 200)),
+                  "张", PLAN_START + timedelta(days=rng57.randint(3, 10)))
+        for i in range(116)
+    ]
+    _sched.Engine._schedule_type = _traced
+    try:
+        r57 = build(orders57, sets57, presses57).run()
+    finally:
+        _sched.Engine._schedule_type = _orig_schedule
+
+    chosen57 = _sched.delivery_key(r57.assignments)
+    best57 = min(key for _, key in attempts)
+    case57_ok = (
+        len(attempts) > 1
+        and chosen57 == best57
+        and best57 != attempts[-1][1]
+    )
+    print(f"[{'PASS' if case57_ok else 'FAIL'}] 组数迭代取字典序最优（不是最后一次）"
+          f"（各轮 {attempts}，采纳 {chosen57}，最后一次是 {attempts[-1][1]}）")
+    results.append(case57_ok)
+
+    # 58. §12.3 第二键：同等开始槽位下取**总占机时**（换模 + 模数）最少者。
+    #     M1 覆盖 X/Y 且优先级更高，但配比低；它先被 Y 批占用而上机。轮到 X 批时，
+    #     留在 M1 上不换模但要跑 20 模，改用 M2 要付 4 模换模却只跑 4 模——总占机时
+    #     8 < 20，故选 M2。只按「换模最少」择优（旧实现按优先级）会选 M1，多占 12 模。
+    sets58 = {"S1": MoldSet("S1", "P01", 1, [
+        mold("M1", "S1", 1, {"X": 2, "Y": 2}),
+        mold("M2", "S1", 2, {"X": 10}),
+    ])}
+    _, r58 = run_case("同起点取总占机时最少", [
+        WorkOrder("W1", "SO1", "P01", "Y", D(20), "张", date(2026, 2, 10)),
+        WorkOrder("W2", "SO2", "P01", "X", D(40), "张", date(2026, 2, 10)),
+    ], sets58, {"R1": Press("R1", 20, "P01")})
+    b58 = sorted(r58.batches, key=lambda b: b.start_slot)
+    case58_ok = (
+        len(b58) == 2
+        and b58[0].mold_no == "M1" and b58[0].changeover_cycles == 0
+        and b58[1].mold_no == "M2"
+        and b58[1].changeover_cycles == 4 and b58[1].cycles == 4
+        and b58[1].changeover_cycles + b58[1].cycles < 20  # 优于留在 M1（20 + 0）
+    )
+    print(f"[{'PASS' if case58_ok else 'FAIL'}] 同起点取总占机时最少"
+          f"（{[ (b.mold_no, b.cycles + b.changeover_cycles) for b in b58 ]}）")
+    results.append(case58_ok)
+
+    # 59. §12.3 第三键：同等开始槽位下取归一后负荷更轻的机台（均衡）。
+    #     只有一副模具时两台机都只能在它空出后开工，开始槽位必然相同，此时按机台
+    #     已提交模数择轻者，两批才会分落两台机；否则会全压在第一台（40 / 0）。
+    sets59 = {"S1": MoldSet("S1", "P01", 1, [mold("M1", "S1", 1, {"X": 2})])}
+    _, r59 = run_case("同起点取负荷最轻的机台", [
+        WorkOrder("W1", "SO1", "P01", "X", D(40), "张", date(2026, 2, 10)),
+        WorkOrder("W2", "SO2", "P01", "X", D(40), "张", date(2026, 2, 10)),
+    ], sets59, {"R1": Press("R1", 20, "P01"), "R2": Press("R2", 20, "P01")})
+    load59: dict[str, int] = {}
+    for b in r59.batches:
+        load59[b.press_no] = load59.get(b.press_no, 0) + b.cycles
+    case59_ok = (
+        len(r59.batches) == 2
+        and len(load59) == 2
+        and len(set(load59.values())) == 1  # 两台机负荷相同
+    )
+    print(f"[{'PASS' if case59_ok else 'FAIL'}] 同起点取负荷最轻的机台"
+          f"（各机台模数 {load59}）")
+    results.append(case59_ok)
 
     print()
     print(f"通过 {sum(results)}/{len(results)}")

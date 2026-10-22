@@ -8,10 +8,13 @@
     "molds": 20,
     "mold_sets": 10
   },
-  "result_hash": "fb73f2639af41cde41c4d823c3b3fd3948f521ff7c568027ca90addf20c7e432",
-  "delayed_work_orders": 60,
+  "result_hash": "9ea73872f9debdc7d6980c2757c0e44f9bfc8a4751fa7d2878598fe853adba35",
+  "delayed_sales_orders": 88,
   "total_delay_days": 636,
+  "delayed_work_orders": 60,
+  "window_utilization": 0.547561,
+  "press_load_imbalance": 0.882539,
   "batches": 426,
   "release_plan_rows": 500,
-  "changeover_count": 0
+  "changeover_count": 3
 }
